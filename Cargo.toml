@@ -1,0 +1,61 @@
+[package]
+name = "chunk_db"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Arrow ecosystem
+arrow = { version = "53", features = ["prettyprint"] }
+parquet = { version = "53", features = ["async"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+bincode = "1"
+
+# Embedded KV store for catalog
+sled = "0.34"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Utilities
+thiserror = "1"
+tracing = "0.1"
+
+# Parallelism
+rayon = "1.10"
+
+[dev-dependencies]
+tempfile = "3"
+duckdb = { version = "1.0", features = ["bundled"] }
+serde_json = "1.0"
+glob = "0.3"
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+
+[[example]]
+name = "query_benchmark"
+path = "examples/query_benchmark.rs"
+
+[[example]]
+name = "parametric_benchmark"
+path = "examples/parametric_benchmark.rs"
+
+[[example]]
+name = "column_scaling_benchmark"
+path = "examples/column_scaling_benchmark.rs"
+
+[[example]]
+name = "playground"
+path = "examples/playground.rs"
+
+[[example]]
+name = "chunkdb_vs_duckdb_benchmark"
+path = "examples/chunkdb_vs_duckdb_benchmark.rs"
+
