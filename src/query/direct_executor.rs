@@ -10,10 +10,12 @@ use crate::query::filter::CompositeFilter;
 use crate::config::TableConfig;
 use crate::catalog::{VersionCatalog, HashRegistry};
 use crate::partitioning::ColumnGroupMapper;
-use crate::storage::{ChunkInfo, chunk_path};
+use crate::storage::{ChunkInfo, ChunkCache, chunk_path};
 use crate::query::filter::{Filter, FilterOp, FilterValue};
 use crate::query::chunk_merger::{group_chunks_by_row_key, vertical_join, RowKey};
 use crate::query::pruning::prune_chunks;
+use crate::write::{PatchLog, apply_patches};
+use crate::api::database::patch_key;
 use crate::Result;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -27,6 +29,10 @@ pub struct DirectExecutor {
     column_mapper: Arc<ColumnGroupMapper>,
     base_path: PathBuf,
     schema: Arc<Schema>,
+    patch_log: Arc<PatchLog>,
+    chunk_cache: Arc<ChunkCache>,
+    /// Snapshot tx_id — reads see only patches with tx_id <= this value
+    snapshot_tx_id: u64,
 }
 
 impl DirectExecutor {
@@ -36,6 +42,9 @@ impl DirectExecutor {
         hash_registries: Arc<Vec<HashRegistry>>,
         column_mapper: Arc<ColumnGroupMapper>,
         base_path: PathBuf,
+        patch_log: Arc<PatchLog>,
+        chunk_cache: Arc<ChunkCache>,
+        snapshot_tx_id: u64,
     ) -> Self {
         let schema = config.arrow_schema();
 
@@ -46,6 +55,9 @@ impl DirectExecutor {
             column_mapper,
             base_path,
             schema,
+            patch_log,
+            chunk_cache,
+            snapshot_tx_id,
         }
     }
 
@@ -222,8 +234,7 @@ impl DirectExecutor {
         // 3. Group by RowKey
         let chunks_by_row_key = group_chunks_by_row_key(pruned_chunks);
 
-        // 4. Flatten to maximize parallelism (avoid nested par_iter)
-        // Convert HashMap<RowKey, Vec<ChunkInfo>> to Vec<(RowKey, Vec<ChunkInfo>)>
+        // 4. Flatten to maximize parallelism
         let row_key_chunks: Vec<_> = chunks_by_row_key.into_iter().collect();
 
         // 5. Parallel scan with rayon on ALL row_keys at once
@@ -277,53 +288,116 @@ impl DirectExecutor {
 
     fn scan_row_key(
         &self,
-        _row_key: &RowKey,
+        row_key: &RowKey,
         chunks: &[ChunkInfo],
         filters: &[Filter],
         projection: Option<&[String]>,
     ) -> Result<Vec<RecordBatch>> {
+        let pk = patch_key(&self.config.name, row_key.row_bucket);
+        let ck = row_key_cache_key(&self.config.name, row_key);
+
+        // --- Try cache first ---
+        if let Some((cached_batch, cached_tx)) = self.chunk_cache.get_with_tx(&ck) {
+            if cached_tx >= self.snapshot_tx_id {
+                // Exact (or newer) hit — use cached, just filter + return
+                let mut result = vec![cached_batch];
+                if !filters.is_empty() {
+                    result = result.into_iter()
+                        .map(|b| apply_row_filters(b, filters))
+                        .collect::<Result<Vec<_>>>()?;
+                }
+                return Ok(result);
+            }
+
+            // Stale hit — apply only the delta (cached_tx .. snapshot_tx_id]
+            let delta = self.patch_log.get_patches_between(&pk, cached_tx, self.snapshot_tx_id);
+            if delta.is_empty() {
+                // No new patches since cache was built — still valid
+                let mut result = vec![cached_batch];
+                if !filters.is_empty() {
+                    result = result.into_iter()
+                        .map(|b| apply_row_filters(b, filters))
+                        .collect::<Result<Vec<_>>>()?;
+                }
+                return Ok(result);
+            }
+
+            // Apply delta patches, update cache
+            let updated = apply_patches(cached_batch, &delta)?;
+            self.chunk_cache.put(ck, updated.clone(), self.snapshot_tx_id);
+            let mut result = vec![updated];
+            if !filters.is_empty() {
+                result = result.into_iter()
+                    .map(|b| apply_row_filters(b, filters))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            return Ok(result);
+        }
+
+        // --- Cache miss: read from disk ---
+        let patches = self.patch_log.get_patches_up_to(&pk, self.snapshot_tx_id);
+        let has_patches = !patches.is_empty();
+
         // Group chunks by column group
         let mut chunks_by_col_group = std::collections::HashMap::new();
         for chunk in chunks {
             chunks_by_col_group.insert(chunk.coord.col_group, chunk.clone());
         }
 
+        let has_disk_chunks = !chunks_by_col_group.is_empty();
         let has_multiple_groups = chunks_by_col_group.len() > 1;
 
-        // Read each column group in parallel
-        // Row group pruning is ALWAYS safe (happens within each Parquet file independently)
-        // Row-level filtering: defer until after vertical join if multiple groups (to avoid applying filter multiple times)
-        // Column group read is independent; vertical_join reconstructs on __row_id
-        let apply_filters = !has_multiple_groups;
+        // When patches exist, read ALL columns (no projection) so we cache a complete chunk.
+        // Filters are always deferred when patches exist (inserts need post-filtering).
+        let read_projection = if has_patches { None } else { projection };
+        let apply_filters_in_read = !has_multiple_groups && !has_patches;
 
-        let batches: Vec<RecordBatch> = chunks_by_col_group
-            .par_iter()
-            .map(|(_, chunk)| {
-                let path = chunk_path(
-                    &self.base_path,
-                    &self.config.name,
-                    &chunk.coord,
-                    chunk.version,
-                );  
-                read_parquet_sync_with_pruning(path, filters, projection, chunk.coord.col_group, &self.column_mapper, apply_filters)
+        let mut result: Vec<RecordBatch> = if has_disk_chunks {
+            let batches: Vec<RecordBatch> = chunks_by_col_group
+                .par_iter()
+                .map(|(_, chunk)| {
+                    let path = chunk_path(
+                        &self.base_path,
+                        &self.config.name,
+                        &chunk.coord,
+                        chunk.version,
+                    );
+                    read_parquet_sync_with_pruning(path, filters, read_projection, chunk.coord.col_group, &self.column_mapper, apply_filters_in_read)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            if batches.is_empty() {
+                return Ok(vec![]);
             }
-        )
-            .collect::<Result<Vec<_>>>()?;
 
-        if batches.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Vertical join if multiple column groups
-        let mut result = if batches.len() > 1 {
-            vec![vertical_join(batches)?]
+            // Vertical join if multiple column groups
+            if batches.len() > 1 {
+                vec![vertical_join(batches)?]
+            } else {
+                batches
+            }
+        } else if has_patches {
+            // No parquet files on disk, but insert patches exist (stream-inserted data).
+            // Start with an empty batch matching the table schema.
+            vec![RecordBatch::new_empty(self.schema.clone())]
         } else {
-            batches
+            return Ok(vec![]);
         };
 
-        // Apply row-level filters AFTER vertical join (if deferred)
-        // Use parallel iterator for better performance with multiple batches
-        if !apply_filters && !filters.is_empty() {
+        // Apply patches up to snapshot tx_id
+        if has_patches {
+            result = result.into_iter()
+                .map(|batch| apply_patches(batch, &patches))
+                .collect::<Result<Vec<_>>>()?;
+
+            // Cache the full patched chunk (pre-filter, all columns)
+            if let Some(batch) = result.first() {
+                self.chunk_cache.put(ck, batch.clone(), self.snapshot_tx_id);
+            }
+        }
+
+        // Apply row-level filters AFTER vertical join and patches (if deferred)
+        if !apply_filters_in_read && !filters.is_empty() {
             result = result
                 .into_par_iter()
                 .map(|batch| apply_row_filters(batch, filters))
@@ -442,6 +516,12 @@ impl DirectExecutor {
 
         Ok(max_val)
     }
+}
+
+/// Build a unique cache key for a RowKey within a table
+fn row_key_cache_key(table: &str, rk: &RowKey) -> Vec<u8> {
+    format!("rk:{}:{}:{:?}:{:?}", table, rk.row_bucket, rk.hash_buckets, rk.range_buckets)
+        .into_bytes()
 }
 
 /// Apply final projection to remove filter-only columns

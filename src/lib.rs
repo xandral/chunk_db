@@ -20,7 +20,9 @@ pub mod write;
 pub use write::BatchInserter;
 
 pub mod query;
-pub use query::{Filter, FilterOp, FilterValue, CompositeFilter, QueryBuilder};
+pub use query::{Filter, FilterOp, FilterValue, CompositeFilter, QueryBuilder, DirectExecutor};
+
+pub mod concurrency;
 
 pub mod api;
 pub use api::{ChunkDb, TableBuilder};
