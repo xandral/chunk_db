@@ -1,5 +1,6 @@
 pub mod batch_insert;
 pub mod patch_log;
+pub(crate) mod patch_wal;
 pub mod patch_apply;
 pub mod stream_insert;
 pub mod compaction;

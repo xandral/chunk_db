@@ -1,6 +1,8 @@
 use sled::Db;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use crate::storage::chunk_coord::ChunkCoordinate;
 use crate::catalog::range_stats::RangeDimensionStats;
 use crate::config::table_config::TableConfig;
@@ -14,6 +16,10 @@ pub struct VersionCatalog {
     next_txn_id: AtomicU64,
     /// Global row ID counter (Snowflake-like)
     next_row_id: AtomicU64,
+    /// In-memory coordinate index per table, loaded lazily from sled and kept
+    /// in sync by every version update. Serves all_chunks() without the
+    /// per-query O(n) sled scan.
+    chunk_index: RwLock<HashMap<String, HashMap<ChunkCoordinate, u64>>>,
 }
 
 impl VersionCatalog {
@@ -38,7 +44,12 @@ impl VersionCatalog {
             None => AtomicU64::new(0),  // Start from 0
         };
 
-        Ok(Self { db, next_txn_id, next_row_id })
+        Ok(Self {
+            db,
+            next_txn_id,
+            next_row_id,
+            chunk_index: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Generate next transaction ID (monotonically increasing)
@@ -73,30 +84,133 @@ impl VersionCatalog {
     pub fn update_version(&self, table_name: &str, coord: &ChunkCoordinate, version: u64) -> Result<()> {
         let key = self.coord_to_key(table_name, coord)?;
         self.db.insert(key, &version.to_be_bytes())?;
+
+        let mut index = self.chunk_index.write().unwrap();
+        if let Some(table_index) = index.get_mut(table_name) {
+            table_index.insert(coord.clone(), version);
+        }
         Ok(())
     }
 
-    /// List all chunk coordinates with their latest versions for a specific table.
+    /// Load a table's coordinates from sled into the in-memory index (once).
     ///
-    /// PERF: O(n) full scan of the sled catalog on every query. At scale (millions of chunks),
-    /// this becomes a bottleneck. Consider caching or maintaining an in-memory index.
-    pub fn all_chunks(&self, table_name: &str) -> Result<Vec<(ChunkCoordinate, u64)>> {
-        let mut results = vec![];
+    /// The write lock is held across the whole sled scan: update_version /
+    /// commit_split write sled first and take this same lock second, so a
+    /// version update landing mid-scan blocks here and is then re-applied on
+    /// the freshly loaded entry — no update can fall between the scan and the
+    /// conditional in-memory maintenance.
+    fn ensure_index_loaded(&self, table_name: &str) -> Result<()> {
+        {
+            let index = self.chunk_index.read().unwrap();
+            if index.contains_key(table_name) {
+                return Ok(());
+            }
+        }
+
+        let mut index = self.chunk_index.write().unwrap();
+        if index.contains_key(table_name) {
+            return Ok(()); // another thread loaded it while we waited
+        }
+
+        let mut table_index = HashMap::new();
         let prefix = format!("__chunk__{}__", table_name);
 
         for item in self.db.scan_prefix(prefix.as_bytes()) {
             let (key, value) = item?;
-
-            // Extract coordinate from key (skip prefix)
             let coord_bytes = &key[prefix.len()..];
-            if let Ok(coord) = bincode::deserialize::<ChunkCoordinate>(coord_bytes) {
-                let arr: [u8; 8] = value.as_ref().try_into().unwrap_or([0u8; 8]);
-                let version = u64::from_be_bytes(arr);
-                results.push((coord, version));
-            }
+            let coord = bincode::deserialize::<ChunkCoordinate>(coord_bytes)
+                .map_err(|e| crate::ChunkDbError::Serialization(format!(
+                    "undecodable chunk coordinate key for table '{}' — the catalog was \
+                     likely written by an incompatible ChunkDB version (no migration \
+                     path exists): {}",
+                    table_name, e
+                )))?;
+            let arr: [u8; 8] = value.as_ref().try_into().unwrap_or([0u8; 8]);
+            table_index.insert(coord, u64::from_be_bytes(arr));
         }
 
-        Ok(results)
+        index.insert(table_name.to_string(), table_index);
+        Ok(())
+    }
+
+    /// List all chunk coordinates with their latest versions for a specific table.
+    /// Served from the in-memory index (sled is scanned once, at first access).
+    pub fn all_chunks(&self, table_name: &str) -> Result<Vec<(ChunkCoordinate, u64)>> {
+        self.ensure_index_loaded(table_name)?;
+        let index = self.chunk_index.read().unwrap();
+        Ok(index.get(table_name)
+            .map(|m| m.iter().map(|(c, &v)| (c.clone(), v)).collect())
+            .unwrap_or_default())
+    }
+
+    /// Coordinates (with versions) of one row cell — every hash/range/column
+    /// group combination sharing `(level, row_bucket)`. Same freshness as
+    /// all_chunks() without cloning the whole table index.
+    pub fn chunks_for_cell(
+        &self,
+        table_name: &str,
+        level: u16,
+        row_bucket: u64,
+    ) -> Result<Vec<(ChunkCoordinate, u64)>> {
+        self.ensure_index_loaded(table_name)?;
+        let index = self.chunk_index.read().unwrap();
+        Ok(index.get(table_name)
+            .map(|m| m.iter()
+                .filter(|(c, _)| c.level == level && c.row_bucket == row_bucket)
+                .map(|(c, &v)| (c.clone(), v))
+                .collect())
+            .unwrap_or_default())
+    }
+
+    /// Atomically commit a row-cell split: children become visible, parent
+    /// coordinates disappear, and the level-map snapshot is persisted — all in
+    /// one sled batch. This is the crash-consistency point of the split: a
+    /// crash before leaves the parent intact (orphan child files are
+    /// harmless), a crash after is fully consistent.
+    pub fn commit_split(
+        &self,
+        table_name: &str,
+        parents: &[ChunkCoordinate],
+        children: &[(ChunkCoordinate, u64)],
+        level_map_snapshot: &[(u16, u64)],
+    ) -> Result<()> {
+        let mut batch = sled::Batch::default();
+
+        for parent in parents {
+            batch.remove(self.coord_to_key(table_name, parent)?);
+        }
+        for (child, version) in children {
+            batch.insert(self.coord_to_key(table_name, child)?, &version.to_be_bytes());
+        }
+
+        let lm_key = format!("__level_map__{}", table_name);
+        let lm_bytes = bincode::serialize(level_map_snapshot)
+            .map_err(|e| crate::ChunkDbError::Serialization(e.to_string()))?;
+        batch.insert(lm_key.as_bytes(), lm_bytes);
+
+        self.db.apply_batch(batch)?;
+        self.db.flush()?;
+
+        let mut index = self.chunk_index.write().unwrap();
+        if let Some(table_index) = index.get_mut(table_name) {
+            for parent in parents {
+                table_index.remove(parent);
+            }
+            for (child, version) in children {
+                table_index.insert(child.clone(), *version);
+            }
+        }
+        Ok(())
+    }
+
+    /// Load the persisted level-map snapshot for a table (empty if absent).
+    pub fn load_level_map(&self, table_name: &str) -> Result<Vec<(u16, u64)>> {
+        let key = format!("__level_map__{}", table_name);
+        match self.db.get(key.as_bytes())? {
+            Some(bytes) => bincode::deserialize(&bytes)
+                .map_err(|e| crate::ChunkDbError::Serialization(e.to_string())),
+            None => Ok(vec![]),
+        }
     }
 
     fn coord_to_key(&self, table_name: &str, coord: &ChunkCoordinate) -> Result<Vec<u8>> {

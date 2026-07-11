@@ -720,3 +720,326 @@ async fn test_compaction_preserves_newer_patches() {
 
     println!("✓ Compaction preserves newer patches: count={}", count);
 }
+
+/// Row counts of the live chunk files of a table, via Parquet metadata.
+fn live_chunk_row_counts(db: &ChunkDb, db_path: &str, table: &str) -> Vec<(String, i64)> {
+    let chunks_dir = std::path::Path::new(db_path).join(table).join("chunks");
+    db.live_chunk_files(table).unwrap().into_iter()
+        .map(|name| {
+            let file = std::fs::File::open(chunks_dir.join(&name)).unwrap();
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap();
+            (name, reader.metadata().file_metadata().num_rows())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_adaptive_row_grid_splits_on_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+
+    let mut db = ChunkDb::open(db_path).unwrap();
+
+    // Coarse base cell (1000 row ids wide), split when a file exceeds 100 rows.
+    let config = TableBuilder::new("adaptive", db_path)
+        .add_column("id", "Int64", false)
+        .add_column("value", "Int64", true)
+        .chunk_rows(1000)
+        .max_cell_rows(100)
+        .with_primary_key_as_row_id("id")
+        .build();
+
+    db.create_table(config).unwrap();
+
+    // Three batches, 900 rows total, all landing in very few base cells —
+    // without splits these files would hold hundreds of rows each.
+    for start in [0i64, 300, 600] {
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(start..start + 300)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((start..start + 300).map(|i| i * 2))) as _),
+        ]).unwrap();
+        db.insert("adaptive", &batch).unwrap();
+    }
+
+    // Correctness: nothing lost, nothing duplicated.
+    let count = db.select_all("adaptive").count().await.unwrap();
+    assert_eq!(count, 900, "All inserted rows must survive splitting");
+
+    let range_count = db.select_all("adaptive")
+        .filter(Filter::between("id", 100, 199))
+        .count().await.unwrap();
+    assert_eq!(range_count, 100, "Range query across split cells");
+
+    let one = db.select_all("adaptive")
+        .filter(Filter::eq("id", 456))
+        .count().await.unwrap();
+    assert_eq!(one, 1, "Point query after splits");
+
+    // Splits actually happened: live files carry the _l{level} marker.
+    let counts = live_chunk_row_counts(&db, db_path, "adaptive");
+    assert!(counts.iter().any(|(name, _)| name.contains("_l")),
+        "Expected split (level > 0) chunk files, got: {:?}", counts);
+
+    // Uniform-row-count property: every live file is within the threshold
+    // (any overflowing file would have been split out of the catalog).
+    let oversized: Vec<_> = counts.iter().filter(|(_, rows)| *rows > 100).collect();
+    assert!(oversized.is_empty(),
+        "Live chunks must respect max_cell_rows: {:?}", oversized);
+
+    println!("✓ Adaptive grid: 900 rows, {} live chunks, all within threshold", counts.len());
+}
+
+#[tokio::test]
+async fn test_adaptive_grid_compact_on_split_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+
+    {
+        let mut db = ChunkDb::open(db_path).unwrap();
+        let config = TableBuilder::new("t", db_path)
+            .add_column("id", "Int64", false)
+            .add_column("value", "Int64", true)
+            .chunk_rows(1000)
+            .max_cell_rows(50)
+            .with_primary_key_as_row_id("id")
+            .build();
+        db.create_table(config).unwrap();
+
+        // Seed 40 rows (below threshold: no split yet)
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(0..40)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((0..40).map(|i| i * 10))) as _),
+        ]).unwrap();
+        db.insert("t", &batch).unwrap();
+
+        // Record patches: update id=5 → value 999, delete id=7
+        let rid = |v: i64| chunk_db::partitioning::i64_to_ordered_u64(v);
+        let upd = RecordBatch::try_from_iter(vec![
+            ("__row_id", Arc::new(UInt64Array::from(vec![rid(5)])) as _),
+            ("id", Arc::new(Int64Array::from(vec![5i64])) as _),
+            ("value", Arc::new(Int64Array::from(vec![999i64])) as _),
+        ]).unwrap();
+        db.update_rows("t", &upd).unwrap();
+        db.delete_rows("t", &[rid(7)]).unwrap();
+
+        // Push the cell over the threshold → split fires → compact-on-split
+        // must bake the patches into the children.
+        let batch2 = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(40..120)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((40..120).map(|i| i * 10))) as _),
+        ]).unwrap();
+        db.insert("t", &batch2).unwrap();
+
+        let count = db.select_all("t").count().await.unwrap();
+        assert_eq!(count, 119, "120 rows - 1 deleted");
+
+        let v5 = db.select_all("t")
+            .filter(Filter::eq("id", 5))
+            .sum("value").await.unwrap();
+        assert_eq!(v5, 999, "Update must survive compact-on-split");
+
+        let gone = db.select_all("t")
+            .filter(Filter::eq("id", 7))
+            .count().await.unwrap();
+        assert_eq!(gone, 0, "Delete must survive compact-on-split");
+    }
+
+    // Reopen: level map must come back from the catalog.
+    {
+        let db = ChunkDb::open(db_path).unwrap();
+        let count = db.select_all("t").count().await.unwrap();
+        assert_eq!(count, 119, "Same result after reopen (level map persisted)");
+
+        let v5 = db.select_all("t")
+            .filter(Filter::eq("id", 5))
+            .sum("value").await.unwrap();
+        assert_eq!(v5, 999, "Baked update visible after reopen");
+    }
+
+    println!("✓ Compact-on-split + level map persistence across reopen");
+}
+
+/// Column groups store a subset of columns per chunk file, while update
+/// patches carry the full table schema. Compaction must project patches onto
+/// each group's schema before applying (F1 of the 0.2 review).
+#[tokio::test]
+async fn test_column_groups_update_then_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+
+    let mut db = ChunkDb::open(db_path).unwrap();
+    let config = TableBuilder::new("cg", db_path)
+        .add_column("id", "Int64", false)
+        .add_column("a", "Int64", true)
+        .add_column("b", "Int64", true)
+        .chunk_rows(1000)
+        .add_column_group(vec!["id", "a"])
+        .add_column_group(vec!["b"])
+        .with_primary_key_as_row_id("id")
+        .build();
+    db.create_table(config).unwrap();
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int64Array::from_iter_values(0..20)) as _),
+        ("a", Arc::new(Int64Array::from_iter_values((0..20).map(|i| i * 10))) as _),
+        ("b", Arc::new(Int64Array::from_iter_values((0..20).map(|i| i * 100))) as _),
+    ]).unwrap();
+    db.insert("cg", &batch).unwrap();
+
+    // Full-schema update patch for id=3
+    let rid = |v: i64| chunk_db::partitioning::i64_to_ordered_u64(v);
+    let upd = RecordBatch::try_from_iter(vec![
+        ("__row_id", Arc::new(UInt64Array::from(vec![rid(3)])) as _),
+        ("id", Arc::new(Int64Array::from(vec![3i64])) as _),
+        ("a", Arc::new(Int64Array::from(vec![-1i64])) as _),
+        ("b", Arc::new(Int64Array::from(vec![-2i64])) as _),
+    ]).unwrap();
+    db.update_rows("cg", &upd).unwrap();
+    db.delete_rows("cg", &[rid(7)]).unwrap();
+
+    // Compaction rewrites each column-group file with the patches applied.
+    let result = db.compact("cg").unwrap();
+    assert!(result.patches_applied > 0, "Compaction must apply the patches");
+
+    let count = db.select_all("cg").count().await.unwrap();
+    assert_eq!(count, 19, "20 rows - 1 deleted");
+
+    let a3 = db.select_all("cg").filter(Filter::eq("id", 3)).sum("a").await.unwrap();
+    assert_eq!(a3, -1, "Update visible on group 0 after compaction");
+    let b3 = db.select_all("cg").filter(Filter::eq("id", 3)).sum("b").await.unwrap();
+    assert_eq!(b3, -2, "Update visible on group 1 after compaction");
+
+    println!("✓ Column groups + update + compact");
+}
+
+/// Same schema-projection requirement on the split path: compact-on-split
+/// applies pending patches to every column-group file of the cell.
+#[tokio::test]
+async fn test_column_groups_update_then_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+
+    let mut db = ChunkDb::open(db_path).unwrap();
+    let config = TableBuilder::new("cgs", db_path)
+        .add_column("id", "Int64", false)
+        .add_column("a", "Int64", true)
+        .add_column("b", "Int64", true)
+        .chunk_rows(1000)
+        .max_cell_rows(50)
+        .add_column_group(vec!["id", "a"])
+        .add_column_group(vec!["b"])
+        .with_primary_key_as_row_id("id")
+        .build();
+    db.create_table(config).unwrap();
+
+    // Seed below threshold, then patch, then overflow the cell → split fires
+    // with pending patches to fold in.
+    let seed = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int64Array::from_iter_values(0..40)) as _),
+        ("a", Arc::new(Int64Array::from_iter_values((0..40).map(|i| i * 10))) as _),
+        ("b", Arc::new(Int64Array::from_iter_values((0..40).map(|i| i * 100))) as _),
+    ]).unwrap();
+    db.insert("cgs", &seed).unwrap();
+
+    let rid = |v: i64| chunk_db::partitioning::i64_to_ordered_u64(v);
+    let upd = RecordBatch::try_from_iter(vec![
+        ("__row_id", Arc::new(UInt64Array::from(vec![rid(5)])) as _),
+        ("id", Arc::new(Int64Array::from(vec![5i64])) as _),
+        ("a", Arc::new(Int64Array::from(vec![-5i64])) as _),
+        ("b", Arc::new(Int64Array::from(vec![-50i64])) as _),
+    ]).unwrap();
+    db.update_rows("cgs", &upd).unwrap();
+    db.delete_rows("cgs", &[rid(7)]).unwrap();
+
+    let overflow = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int64Array::from_iter_values(40..120)) as _),
+        ("a", Arc::new(Int64Array::from_iter_values((40..120).map(|i| i * 10))) as _),
+        ("b", Arc::new(Int64Array::from_iter_values((40..120).map(|i| i * 100))) as _),
+    ]).unwrap();
+    db.insert("cgs", &overflow).unwrap();
+
+    let count = db.select_all("cgs").count().await.unwrap();
+    assert_eq!(count, 119, "120 rows - 1 deleted, across split column groups");
+
+    let a5 = db.select_all("cgs").filter(Filter::eq("id", 5)).sum("a").await.unwrap();
+    assert_eq!(a5, -5, "Update on group 0 survives compact-on-split");
+    let b5 = db.select_all("cgs").filter(Filter::eq("id", 5)).sum("b").await.unwrap();
+    assert_eq!(b5, -50, "Update on group 1 survives compact-on-split");
+
+    let gone = db.select_all("cgs").filter(Filter::eq("id", 7)).count().await.unwrap();
+    assert_eq!(gone, 0, "Delete survives compact-on-split");
+
+    // The split really happened (level marker in live filenames).
+    let counts = live_chunk_row_counts(&db, db_path, "cgs");
+    assert!(counts.iter().any(|(name, _)| name.contains("_l")),
+        "Expected split chunk files, got: {:?}", counts);
+
+    println!("✓ Column groups + update + split (compact-on-split projection)");
+}
+
+/// Un-compacted updates/deletes must survive a restart: the PatchLog is
+/// WAL-backed. No compact() before the reopen — the patches live only in the
+/// WAL.
+#[tokio::test]
+async fn test_patch_wal_durability_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let rid = |v: i64| chunk_db::partitioning::i64_to_ordered_u64(v);
+
+    {
+        let mut db = ChunkDb::open(db_path).unwrap();
+        let config = TableBuilder::new("w", db_path)
+            .add_column("id", "Int64", false)
+            .add_column("value", "Int64", true)
+            .chunk_rows(1000)
+            .with_primary_key_as_row_id("id")
+            .build();
+        db.create_table(config).unwrap();
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(0..10)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((0..10).map(|i| i * 10))) as _),
+        ]).unwrap();
+        db.insert("w", &batch).unwrap();
+
+        let upd = RecordBatch::try_from_iter(vec![
+            ("__row_id", Arc::new(UInt64Array::from(vec![rid(3)])) as _),
+            ("id", Arc::new(Int64Array::from(vec![3i64])) as _),
+            ("value", Arc::new(Int64Array::from(vec![777i64])) as _),
+        ]).unwrap();
+        db.update_rows("w", &upd).unwrap();
+        db.delete_rows("w", &[rid(5)]).unwrap();
+        // Deliberately no compact(): drop with the patches only in the WAL.
+    }
+
+    {
+        let db = ChunkDb::open(db_path).unwrap();
+        assert!(db.patch_log().total_entries() > 0, "WAL replay must restore patches");
+
+        let count = db.select_all("w").count().await.unwrap();
+        assert_eq!(count, 9, "Delete must survive the reopen");
+        let v3 = db.select_all("w").filter(Filter::eq("id", 3)).sum("value").await.unwrap();
+        assert_eq!(v3, 777, "Update must survive the reopen");
+
+        // Compaction materializes the replayed patches and empties the WAL.
+        let result = db.compact("w").unwrap();
+        assert!(result.patches_applied > 0);
+        let wal_len = std::fs::metadata(
+            std::path::Path::new(db_path).join("wal").join("patches.wal")
+        ).unwrap().len();
+        assert_eq!(wal_len, 0, "WAL must be truncated once all patches are materialized");
+    }
+
+    // Third generation: everything still there with an empty WAL.
+    {
+        let db = ChunkDb::open(db_path).unwrap();
+        let count = db.select_all("w").count().await.unwrap();
+        assert_eq!(count, 9);
+        let v3 = db.select_all("w").filter(Filter::eq("id", 3)).sum("value").await.unwrap();
+        assert_eq!(v3, 777);
+    }
+
+    println!("✓ Patch WAL: updates/deletes survive reopen, WAL truncated after compaction");
+}

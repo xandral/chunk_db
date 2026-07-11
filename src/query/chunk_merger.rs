@@ -12,6 +12,7 @@ use crate::storage::ChunkInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowKey {
     pub row_bucket: u64,
+    pub level: u16,
     pub hash_buckets: Vec<u64>,
     pub range_buckets: Vec<u64>,
 }
@@ -20,9 +21,20 @@ impl From<&ChunkCoordinate> for RowKey {
     fn from(coord: &ChunkCoordinate) -> Self {
         Self {
             row_bucket: coord.row_bucket,
+            level: coord.level,
             hash_buckets: coord.hash_buckets.clone(),
             range_buckets: coord.range_buckets.clone(),
         }
+    }
+}
+
+impl RowKey {
+    /// Chunk-cache key for this row cell. Shared by the executor (lookups)
+    /// and the write path (invalidation on merge-on-write and split).
+    pub fn cache_key(&self, table: &str) -> Vec<u8> {
+        format!("rk:{}:{}:{}:{:?}:{:?}",
+            table, self.level, self.row_bucket, self.hash_buckets, self.range_buckets)
+            .into_bytes()
     }
 }
 

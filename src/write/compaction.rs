@@ -3,9 +3,10 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::catalog::VersionCatalog;
+use crate::concurrency::CompactionLock;
 use crate::storage::{chunk_path, write_parquet, ChunkCache};
 use crate::write::patch_log::PatchLog;
-use crate::write::patch_apply::apply_patches;
+use crate::write::patch_apply::{apply_patches, project_patches_to_schema};
 use crate::{ChunkDbError, Result};
 
 pub struct Compactor<'a> {
@@ -13,6 +14,7 @@ pub struct Compactor<'a> {
     patch_log: &'a PatchLog,
     chunk_cache: &'a ChunkCache,
     base_path: &'a PathBuf,
+    compaction_lock: &'a CompactionLock,
 }
 
 #[derive(Debug)]
@@ -40,8 +42,9 @@ impl<'a> Compactor<'a> {
         patch_log: &'a PatchLog,
         chunk_cache: &'a ChunkCache,
         base_path: &'a PathBuf,
+        compaction_lock: &'a CompactionLock,
     ) -> Self {
-        Self { catalog, patch_log, chunk_cache, base_path }
+        Self { catalog, patch_log, chunk_cache, base_path, compaction_lock }
     }
 
     /// Compact all dirty row_buckets for a table.
@@ -56,22 +59,33 @@ impl<'a> Compactor<'a> {
 
         let prefix = format!("patch:{}:", table_name);
 
-        // Get all chunks for this table once
-        let all_chunks = self.catalog.all_chunks(table_name)?;
-
         for patch_key in dirty_keys {
             let key_str = match std::str::from_utf8(&patch_key) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
-            let row_bucket_str = match key_str.strip_prefix(&prefix) {
+            // Key format: patch:{table}:{level}:{row_bucket}
+            let cell_str = match key_str.strip_prefix(&prefix) {
                 Some(s) => s,
                 None => continue,
             };
-            let row_bucket: u64 = match row_bucket_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
+            let (level, row_bucket) = match cell_str.split_once(':') {
+                Some((l, b)) => match (l.parse::<u16>(), b.parse::<u64>()) {
+                    (Ok(l), Ok(b)) => (l, b),
+                    _ => continue,
+                },
+                None => continue,
+            };
+
+            // Per-cell mutual exclusion with split_cell: a splitting cell is
+            // skipped (its patches are handled by the split itself), and a
+            // cell we hold cannot be split under us — so the coordinates read
+            // below stay live for the whole rewrite and update_version cannot
+            // resurrect a removed parent.
+            let _cell_guard = match self.compaction_lock.try_acquire(&patch_key) {
+                Some(guard) => guard,
+                None => continue,
             };
 
             // Only apply patches up to the compaction snapshot
@@ -81,12 +95,12 @@ impl<'a> Compactor<'a> {
             }
             let patches_count = patches.len();
 
-            let matching_chunks: Vec<_> = all_chunks.iter()
-                .filter(|(coord, _)| coord.row_bucket == row_bucket)
-                .collect();
+            // Read the cell's coordinates *after* taking the lock — a split
+            // that committed before we locked has already removed the parents.
+            let matching_chunks = self.catalog.chunks_for_cell(table_name, level, row_bucket)?;
 
             if matching_chunks.is_empty() {
-                self.patch_log.clear_patches_up_to(&patch_key, compact_tx);
+                self.patch_log.clear_patches_up_to(&patch_key, compact_tx)?;
                 continue;
             }
 
@@ -101,7 +115,10 @@ impl<'a> Compactor<'a> {
                 let batch = read_parquet_file(&path)?;
                 let bytes_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-                let compacted = apply_patches(batch, &patches)?;
+                // Chunk files hold __row_id + one column group; patch batches
+                // carry the full table schema. Project before applying.
+                let projected = project_patches_to_schema(&patches, &batch.schema())?;
+                let compacted = apply_patches(batch, &projected)?;
 
                 let new_path = chunk_path(self.base_path, table_name, coord, new_version);
                 write_parquet(&new_path, &compacted, None)?;
@@ -117,7 +134,7 @@ impl<'a> Compactor<'a> {
             total.patches_applied += patches_count;
 
             // Only clear patches up to compact_tx — newer patches stay for concurrent readers
-            self.patch_log.clear_patches_up_to(&patch_key, compact_tx);
+            self.patch_log.clear_patches_up_to(&patch_key, compact_tx)?;
         }
 
         // Invalidate entire cache — cached entries may reference patches that were just

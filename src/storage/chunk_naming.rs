@@ -3,12 +3,16 @@ use crate::{ChunkDbError, Result};
 use std::path::PathBuf;
 
 /// Generate chunk filename from coordinate and version
-/// Format: chunk_r{row}_c{col}_h{hash1}-{hash2}-..._rg{range1}-{range2}-..._v{version}.parquet
+/// Format: chunk_r{row}[_l{level}]_c{col}_h{hash1}-{hash2}-..._rg{range1}-{range2}-..._v{version}.parquet
+/// The `_l{level}` part is omitted at level 0, so v0 filenames stay valid.
 pub fn format_chunk_filename(coord: &ChunkCoordinate, version: u64) -> String {
-    let mut parts = vec![
-        format!("chunk_r{}", coord.row_bucket),
-        format!("c{}", coord.col_group),
-    ];
+    let mut parts = vec![format!("chunk_r{}", coord.row_bucket)];
+
+    if coord.level > 0 {
+        parts.push(format!("l{}", coord.level));
+    }
+
+    parts.push(format!("c{}", coord.col_group));
 
     // Add hash buckets if present
     if !coord.hash_buckets.is_empty() {
@@ -42,6 +46,7 @@ pub fn parse_chunk_filename(filename: &str) -> Result<(ChunkCoordinate, u64)> {
     let parts: Vec<&str> = name.split('_').collect();
 
     let mut row_bucket: Option<u64> = None;
+    let mut level: u16 = 0;
     let mut col_group: Option<u16> = None;
     let mut hash_buckets: Vec<u64> = vec![];
     let mut range_buckets: Vec<u64> = vec![];
@@ -50,6 +55,9 @@ pub fn parse_chunk_filename(filename: &str) -> Result<(ChunkCoordinate, u64)> {
     for part in parts {
         if part == "chunk" {
             continue;
+        } else if let Some(l) = part.strip_prefix('l') {
+            level = l.parse().map_err(|_|
+                ChunkDbError::InvalidChunkFilename(filename.to_string()))?;
         } else if let Some(rg) = part.strip_prefix("rg") {
             // Check "rg" BEFORE "r" to avoid false match
             range_buckets = rg.split('-')
@@ -81,6 +89,7 @@ pub fn parse_chunk_filename(filename: &str) -> Result<(ChunkCoordinate, u64)> {
     let coord = ChunkCoordinate {
         row_bucket: row_bucket.ok_or_else(||
             ChunkDbError::InvalidChunkFilename(filename.to_string()))?,
+        level,
         col_group: col_group.ok_or_else(||
             ChunkDbError::InvalidChunkFilename(filename.to_string()))?,
         hash_buckets,
@@ -109,6 +118,7 @@ mod tests {
     fn test_format_parse_roundtrip() {
         let coord = ChunkCoordinate {
             row_bucket: 5,
+            level: 0,
             col_group: 2,
             hash_buckets: vec![42, 17],
             range_buckets: vec![100, 200],
@@ -127,6 +137,7 @@ mod tests {
     fn test_minimal_chunk_name() {
         let coord = ChunkCoordinate {
             row_bucket: 0,
+            level: 0,
             col_group: 0,
             hash_buckets: vec![],
             range_buckets: vec![],
@@ -134,6 +145,35 @@ mod tests {
 
         let filename = format_chunk_filename(&coord, 1);
         assert_eq!(filename, "chunk_r0_c0_v1.parquet");
+    }
+
+    #[test]
+    fn test_level_roundtrip() {
+        let coord = ChunkCoordinate {
+            row_bucket: 11,
+            level: 3,
+            col_group: 1,
+            hash_buckets: vec![7],
+            range_buckets: vec![4610],
+        };
+
+        let filename = format_chunk_filename(&coord, 2);
+        assert_eq!(filename, "chunk_r11_l3_c1_h7_rg4610_v2.parquet");
+
+        let (parsed_coord, parsed_version) = parse_chunk_filename(&filename).unwrap();
+        assert_eq!(parsed_coord, coord);
+        assert_eq!(parsed_version, 2);
+    }
+
+    #[test]
+    fn test_legacy_v0_filename_parses_as_level_zero() {
+        let (coord, version) = parse_chunk_filename("chunk_r0_c1_h7_rg4610_v2.parquet").unwrap();
+        assert_eq!(coord.level, 0);
+        assert_eq!(coord.row_bucket, 0);
+        assert_eq!(coord.col_group, 1);
+        assert_eq!(coord.hash_buckets, vec![7]);
+        assert_eq!(coord.range_buckets, vec![4610]);
+        assert_eq!(version, 2);
     }
 }
 

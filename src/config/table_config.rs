@@ -45,8 +45,14 @@ pub enum RowIdStrategy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitioningConfig {
-    /// Rows per chunk bucket
+    /// Rows per chunk bucket. With the adaptive grid (max_cell_rows set) this
+    /// is the level-0 base cell width in row-id space — make it coarse.
     pub chunk_rows: u64,
+
+    /// Adaptive row grid: split a row cell in half when a chunk file exceeds
+    /// this many rows. None (default) = fixed grid, exact v0 behavior.
+    #[serde(default)]
+    pub max_cell_rows: Option<u64>,
 
     /// Range dimensions (timestamp, incremental IDs)
     #[serde(default)]

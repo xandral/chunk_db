@@ -21,6 +21,27 @@ impl CompactionLock {
         let mut set = self.locks.write().unwrap();
         set.remove(chunk_key);
     }
+
+    /// RAII variant of try_lock: the returned guard unlocks on drop (also on
+    /// early returns and errors). None = someone else holds the key.
+    pub fn try_acquire(&self, chunk_key: &[u8]) -> Option<CompactionGuard<'_>> {
+        if self.try_lock(chunk_key) {
+            Some(CompactionGuard { lock: self, key: chunk_key.to_vec() })
+        } else {
+            None
+        }
+    }
+}
+
+pub struct CompactionGuard<'a> {
+    lock: &'a CompactionLock,
+    key: Vec<u8>,
+}
+
+impl Drop for CompactionGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.unlock(&self.key);
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{HashRegistry, VersionCatalog, RangeDimensionStats};
 use crate::config::table_config::{TableConfig, RowIdStrategy};
-use crate::partitioning::{ColumnGroupMapper, overlapping_buckets, i64_to_ordered_u64};
+use crate::partitioning::{ColumnGroupMapper, cell_row_range, overlapping_buckets, i64_to_ordered_u64};
 use crate::query::filter::{Filter, FilterOp, FilterValue};
 use crate::storage::ChunkInfo;
 use crate::Result;
@@ -118,24 +118,23 @@ pub fn prune_chunks(
             }
         }
 
-        // If we have bounds, prune row_buckets using order-preserving i64→u64 mapping
+        // If we have bounds, prune by interval overlap between the cell's
+        // row-id range (level-aware) and the predicate range, using the
+        // order-preserving i64→u64 mapping. At level 0 the cell range is
+        // [b*chunk_rows, (b+1)*chunk_rows) — identical to v0 bucket pruning.
         if min_val != i64::MIN || max_val != i64::MAX {
             let chunk_rows = config.partitioning.chunk_rows;
 
-            let min_bucket = if min_val == i64::MIN {
-                0
-            } else {
-                i64_to_ordered_u64(min_val) / chunk_rows
-            };
-
-            let max_bucket = if max_val == i64::MAX {
-                u64::MAX
-            } else {
-                i64_to_ordered_u64(max_val) / chunk_rows
-            };
+            let min_u = if min_val == i64::MIN { 0 } else { i64_to_ordered_u64(min_val) };
+            let max_u = if max_val == i64::MAX { u64::MAX } else { i64_to_ordered_u64(max_val) };
 
             candidates.retain(|chunk| {
-                chunk.coord.row_bucket >= min_bucket && chunk.coord.row_bucket <= max_bucket
+                let (start, end) =
+                    cell_row_range(chunk.coord.row_bucket, chunk_rows, chunk.coord.level);
+                // overlap of [start, end) with [min_u, max_u]; a clamped end
+                // (u64::MAX) is treated as inclusive so the last cell of the
+                // row-id space is never pruned away (over-inclusion is safe).
+                start <= max_u && (end > min_u || end == u64::MAX)
             });
         }
     }
@@ -213,11 +212,12 @@ pub fn prune_chunks(
     candidates.retain(|chunk| required_groups.contains(&chunk.coord.col_group));
 
     // 6. Version resolution
-    let mut latest_by_coord: HashMap<(u64, u16, Vec<u64>, Vec<u64>), ChunkInfo> = HashMap::new();
+    let mut latest_by_coord: HashMap<(u64, u16, u16, Vec<u64>, Vec<u64>), ChunkInfo> = HashMap::new();
 
     for chunk in candidates {
         let key = (
             chunk.coord.row_bucket,
+            chunk.coord.level,
             chunk.coord.col_group,
             chunk.coord.hash_buckets.clone(),
             chunk.coord.range_buckets.clone(),

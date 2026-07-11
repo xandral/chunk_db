@@ -293,8 +293,8 @@ impl DirectExecutor {
         filters: &[Filter],
         projection: Option<&[String]>,
     ) -> Result<Vec<RecordBatch>> {
-        let pk = patch_key(&self.config.name, row_key.row_bucket);
-        let ck = row_key_cache_key(&self.config.name, row_key);
+        let pk = patch_key(&self.config.name, row_key.level, row_key.row_bucket);
+        let ck = row_key.cache_key(&self.config.name);
 
         // --- Try cache first ---
         if let Some((cached_batch, cached_tx)) = self.chunk_cache.get_with_tx(&ck) {
@@ -516,12 +516,6 @@ impl DirectExecutor {
 
         Ok(max_val)
     }
-}
-
-/// Build a unique cache key for a RowKey within a table
-fn row_key_cache_key(table: &str, rk: &RowKey) -> Vec<u8> {
-    format!("rk:{}:{}:{:?}:{:?}", table, rk.row_bucket, rk.hash_buckets, rk.range_buckets)
-        .into_bytes()
 }
 
 /// Apply final projection to remove filter-only columns

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::catalog::{VersionCatalog, HashRegistry};
+use crate::concurrency::CompactionLock;
 use crate::config::table_config::TableConfig;
-use crate::partitioning::{ColumnGroupMapper, row_bucket};
+use crate::partitioning::{ColumnGroupMapper, LevelMap};
 use crate::query::{DirectExecutor, QueryBuilder};
 use crate::storage::ChunkCache;
 use crate::write::{BatchInserter, PatchLog, PatchOp, StreamInserter, StreamConfig};
@@ -18,6 +19,8 @@ struct TableState {
     config: TableConfig,
     hash_registries: Vec<HashRegistry>,
     column_mapper: ColumnGroupMapper,
+    /// Adaptive row grid refinement map (empty = pure level-0 fixed grid)
+    level_map: Arc<LevelMap>,
 }
 
 /// Main database handle
@@ -28,6 +31,44 @@ pub struct ChunkDb {
     tables: HashMap<String, TableState>,
     patch_log: Arc<PatchLog>,
     chunk_cache: Arc<ChunkCache>,
+    /// Per-cell mutual exclusion between compaction and cell splits
+    compaction_lock: Arc<CompactionLock>,
+}
+
+/// Build the per-table runtime state (hash registries, column mapper, level
+/// map) from a persisted config — shared by `open` and `create_table`.
+fn build_table_state(
+    catalog_db: &Arc<sled::Db>,
+    version_catalog: &VersionCatalog,
+    config: TableConfig,
+) -> Result<TableState> {
+    let hash_registries: Vec<HashRegistry> = config
+        .partitioning
+        .hash_dimensions
+        .iter()
+        .map(|dim| {
+            HashRegistry::new(
+                catalog_db.clone(),
+                &dim.column,
+                dim.num_buckets,
+                dim.strategy.clone(),
+            )
+        })
+        .collect();
+
+    let column_mapper = ColumnGroupMapper::new(&config);
+
+    let level_map = Arc::new(LevelMap::from_snapshot(
+        config.partitioning.chunk_rows,
+        version_catalog.load_level_map(&config.name)?,
+    )?);
+
+    Ok(TableState {
+        config,
+        hash_registries,
+        column_mapper,
+        level_map,
+    })
 }
 
 impl ChunkDb {
@@ -46,34 +87,16 @@ impl ChunkDb {
 
         for table_name in table_names {
             if let Some(config) = version_catalog.load_table_config(&table_name)? {
-                // Recreate hash registries and column mapper
-                let hash_registries: Vec<HashRegistry> = config
-                    .partitioning
-                    .hash_dimensions
-                    .iter()
-                    .map(|dim| {
-                        HashRegistry::new(
-                            catalog_db.clone(),
-                            &dim.column,
-                            dim.num_buckets,
-                            dim.strategy.clone(),
-                        )
-                    })
-                    .collect();
-
-                let column_mapper = ColumnGroupMapper::new(&config);
-
-                let table_state = TableState {
-                    config,
-                    hash_registries,
-                    column_mapper,
-                };
-
+                let table_state = build_table_state(&catalog_db, &version_catalog, config)?;
                 tables.insert(table_name, table_state);
             }
         }
 
-        let patch_log = Arc::new(PatchLog::new());
+        // Durable patch log: updates/deletes are WAL-backed and survive a
+        // crash (replayed here); compaction/splits materialize and clear them.
+        let patch_log = Arc::new(PatchLog::with_wal(
+            &base_path.join("wal").join("patches.wal"),
+        )?);
         let chunk_cache = Arc::new(ChunkCache::new(1024));
 
         Ok(Self {
@@ -83,6 +106,7 @@ impl ChunkDb {
             tables,
             patch_log,
             chunk_cache,
+            compaction_lock: Arc::new(CompactionLock::new()),
         })
     }
 
@@ -94,29 +118,7 @@ impl ChunkDb {
         let table_path = self.base_path.join(&table_name);
         std::fs::create_dir_all(table_path.join("chunks"))?;
 
-        // Create hash registries and column mapper
-        let hash_registries: Vec<HashRegistry> = config
-            .partitioning
-            .hash_dimensions
-            .iter()
-            .map(|dim| {
-                HashRegistry::new(
-                    self.catalog_db.clone(),
-                    &dim.column,
-                    dim.num_buckets,
-                    dim.strategy.clone(),
-                )
-            })
-            .collect();
-
-        let column_mapper = ColumnGroupMapper::new(&config);
-
-        let table_state = TableState {
-            config: config.clone(),
-            hash_registries,
-            column_mapper,
-        };
-
+        let table_state = build_table_state(&self.catalog_db, &self.version_catalog, config.clone())?;
         self.tables.insert(table_name, table_state);
 
         // Persist table configuration to catalog
@@ -138,11 +140,19 @@ impl ChunkDb {
                 format!("Table '{}' not found", table_name)
             ))?;
 
-        Ok(BatchInserter::new(
+        Ok(self.build_inserter(table_state))
+    }
+
+    fn build_inserter(&self, table_state: &TableState) -> BatchInserter {
+        BatchInserter::new(
             table_state.config.clone(),
             self.version_catalog.clone(),
             self.catalog_db.clone(),
-        ))
+            table_state.level_map.clone(),
+            self.patch_log.clone(),
+            self.chunk_cache.clone(),
+            self.compaction_lock.clone(),
+        )
     }
 
     /// Insert a batch into a table
@@ -192,19 +202,22 @@ impl ChunkDb {
             .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
 
         let tx_id = self.version_catalog.next_transaction_id()?;
-        let chunk_rows = table_state.config.partitioning.chunk_rows;
 
-        // Group row_ids by row_bucket
-        let mut by_bucket: HashMap<u64, Vec<u64>> = HashMap::new();
+        // Group row_ids by leaf row cell. The routing guard stays alive until
+        // the patches are recorded: a concurrent split cannot mark this cell
+        // refined (and drain its patches) in between.
+        let router = table_state.level_map.routing();
+        let mut by_cell: HashMap<(u16, u64), Vec<u64>> = HashMap::new();
         for &rid in row_ids {
-            let bucket = row_bucket(rid, chunk_rows);
-            by_bucket.entry(bucket).or_default().push(rid);
+            let cell = router.route(rid);
+            by_cell.entry(cell).or_default().push(rid);
         }
 
-        for (bucket, ids) in by_bucket {
-            let key = patch_key(table_name, bucket);
+        for ((level, bucket), ids) in by_cell {
+            let key = patch_key(table_name, level, bucket);
             self.patch_log.record(&key, tx_id, PatchOp::Delete(ids))?;
         }
+        drop(router);
 
         Ok(tx_id)
     }
@@ -215,25 +228,27 @@ impl ChunkDb {
             .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
 
         let tx_id = self.version_catalog.next_transaction_id()?;
-        let chunk_rows = table_state.config.partitioning.chunk_rows;
 
         let row_id_idx = batch.schema().index_of("__row_id")?;
         let row_ids = batch.column(row_id_idx).as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| ChunkDbError::Config("__row_id must be UInt64".into()))?;
 
-        // Group row indices by row_bucket
-        let mut by_bucket: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Group row indices by leaf row cell. The routing guard stays alive
+        // until the patches are recorded (see delete_rows).
+        let router = table_state.level_map.routing();
+        let mut by_cell: HashMap<(u16, u64), Vec<usize>> = HashMap::new();
         for i in 0..row_ids.len() {
-            let bucket = row_bucket(row_ids.value(i), chunk_rows);
-            by_bucket.entry(bucket).or_default().push(i);
+            let cell = router.route(row_ids.value(i));
+            by_cell.entry(cell).or_default().push(i);
         }
 
-        for (bucket, indices) in by_bucket {
+        for ((level, bucket), indices) in by_cell {
             let sub_batch = take_rows(batch, &indices)?;
-            let key = patch_key(table_name, bucket);
+            let key = patch_key(table_name, level, bucket);
             self.patch_log.record(&key, tx_id, PatchOp::Update(sub_batch))?;
         }
+        drop(router);
 
         Ok(tx_id)
     }
@@ -245,6 +260,7 @@ impl ChunkDb {
             &self.patch_log,
             &self.chunk_cache,
             &self.base_path,
+            &self.compaction_lock,
         );
         compactor.compact_all(table_name)
     }
@@ -252,6 +268,16 @@ impl ChunkDb {
     /// Get a reference to the patch log (for advanced usage)
     pub fn patch_log(&self) -> &Arc<PatchLog> {
         &self.patch_log
+    }
+
+    /// Filenames of the chunks currently referenced by the catalog (latest
+    /// version per live coordinate). Files on disk not in this list are
+    /// orphans: superseded versions or pre-split parents.
+    pub fn live_chunk_files(&self, table_name: &str) -> Result<Vec<String>> {
+        let chunks = self.version_catalog.all_chunks(table_name)?;
+        Ok(chunks.iter()
+            .map(|(coord, version)| crate::storage::format_chunk_filename(coord, *version))
+            .collect())
     }
 
     /// Create a streaming inserter that buffers small batches and flushes
@@ -268,11 +294,7 @@ impl ChunkDb {
             .collect();
         let user_schema = Arc::new(arrow::datatypes::Schema::new(user_fields));
 
-        let inserter = BatchInserter::new(
-            table_state.config.clone(),
-            self.version_catalog.clone(),
-            self.catalog_db.clone(),
-        );
+        let inserter = self.build_inserter(table_state);
 
         Ok(StreamInserter::new(user_schema, inserter, config))
     }
@@ -289,6 +311,7 @@ impl ChunkDb {
         let chunk_cache = self.chunk_cache.clone();
         let version_catalog = self.version_catalog.clone();
         let base_path = self.base_path.clone();
+        let compaction_lock = self.compaction_lock.clone();
         let table = table_name.to_string();
 
         let join_handle = tokio::spawn(async move {
@@ -310,6 +333,7 @@ impl ChunkDb {
                         &patch_log,
                         &chunk_cache,
                         &base_path,
+                        &compaction_lock,
                     );
                     let _ = compactor.compact_all(&table);
                 }
@@ -336,6 +360,7 @@ impl TableBuilder {
             columns: vec![],
             partitioning: crate::config::table_config::PartitioningConfig {
                 chunk_rows: 100_000,
+                max_cell_rows: None,
                 range_dimensions: vec![],
                 hash_dimensions: vec![],
                 column_groups: vec![],
@@ -367,6 +392,13 @@ impl TableBuilder {
 
     pub fn chunk_rows(mut self, rows: u64) -> Self {
         self.partitioning.chunk_rows = rows;
+        self
+    }
+
+    /// Enable the adaptive row grid: split a row cell when a chunk file
+    /// exceeds `rows`. Pair with a coarse `chunk_rows` base width.
+    pub fn max_cell_rows(mut self, rows: u64) -> Self {
+        self.partitioning.max_cell_rows = Some(rows);
         self
     }
 
@@ -437,9 +469,9 @@ impl TableBuilder {
     }
 }
 
-/// Build a patch key from table name and row_bucket
-pub(crate) fn patch_key(table_name: &str, row_bucket: u64) -> Vec<u8> {
-    format!("patch:{}:{}", table_name, row_bucket).into_bytes()
+/// Build a patch key from table name and row cell (level + bucket)
+pub(crate) fn patch_key(table_name: &str, level: u16, row_bucket: u64) -> Vec<u8> {
+    format!("patch:{}:{}:{}", table_name, level, row_bucket).into_bytes()
 }
 
 /// Extract specific rows from a RecordBatch by index

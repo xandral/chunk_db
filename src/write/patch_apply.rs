@@ -1,9 +1,50 @@
 use std::collections::HashSet;
 use arrow::array::{UInt64Array, BooleanArray};
 use arrow::compute;
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::patch_log::{PatchEntry, PatchOp};
+
+/// Project patch batches onto a chunk's schema before applying them.
+///
+/// Update/Insert patch batches carry the full table schema, but a chunk file
+/// holds only `__row_id` + one column group. Applying an unprojected patch to
+/// such a chunk fails on schema mismatch in `concat_batches`. This reorders /
+/// subsets the patch columns to match the target schema by name; a column the
+/// target needs but the patch lacks is a loud error. Delete patches carry no
+/// batch and pass through unchanged.
+pub fn project_patches_to_schema(
+    patches: &[PatchEntry],
+    schema: &SchemaRef,
+) -> crate::Result<Vec<PatchEntry>> {
+    patches.iter()
+        .map(|entry| {
+            let op = match &entry.op {
+                PatchOp::Delete(ids) => PatchOp::Delete(ids.clone()),
+                PatchOp::Update(batch) => PatchOp::Update(project_batch(batch, schema)?),
+                PatchOp::Insert(batch) => PatchOp::Insert(project_batch(batch, schema)?),
+            };
+            Ok(PatchEntry { tx_id: entry.tx_id, op })
+        })
+        .collect()
+}
+
+fn project_batch(batch: &RecordBatch, schema: &SchemaRef) -> crate::Result<RecordBatch> {
+    let source_schema = batch.schema();
+    let columns: crate::Result<Vec<_>> = schema.fields().iter()
+        .map(|field| {
+            let idx = source_schema.index_of(field.name()).map_err(|_| {
+                crate::ChunkDbError::Config(format!(
+                    "patch batch is missing column '{}' required by the target chunk",
+                    field.name()
+                ))
+            })?;
+            Ok(batch.column(idx).clone())
+        })
+        .collect();
+    Ok(RecordBatch::try_new(schema.clone(), columns?)?)
+}
 
 pub fn apply_patches(mut batch: RecordBatch, patches: &[PatchEntry]) -> crate::Result<RecordBatch> {
     for patch in patches {
@@ -58,7 +99,7 @@ fn append_rows(base: RecordBatch, new_rows: &RecordBatch) -> crate::Result<Recor
     Ok(compute::concat_batches(&base.schema(), &[base, new_rows.clone()])?)
 }
 
-fn filter_batch(batch: &RecordBatch, mask: &BooleanArray) -> crate::Result<RecordBatch> {
+pub(crate) fn filter_batch(batch: &RecordBatch, mask: &BooleanArray) -> crate::Result<RecordBatch> {
     let filtered_columns: crate::Result<Vec<_>> = batch.columns().iter()
         .map(|col| Ok(compute::filter(col, mask)?))
         .collect();

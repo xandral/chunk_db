@@ -7,10 +7,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::api::database::patch_key;
 use crate::catalog::{HashRegistry, VersionCatalog};
+use crate::concurrency::CompactionLock;
 use crate::config::table_config::TableConfig;
-use crate::partitioning::{ColumnGroupMapper, i64_to_ordered_u64, range_bucket, row_bucket};
-use crate::storage::{chunk_path, ChunkCoordinate, write_parquet};
+use crate::partitioning::{
+    bucket_at_level, cell_is_splittable, i64_to_ordered_u64, range_bucket,
+    ColumnGroupMapper, LevelMap,
+};
+use crate::query::chunk_merger::RowKey;
+use crate::storage::{chunk_path, ChunkCache, ChunkCoordinate, write_parquet};
+use crate::write::patch_apply::{apply_patches, filter_batch, project_patches_to_schema};
+use crate::write::patch_log::{PatchLog, PatchOp};
 use crate::Result;
 use arrow::array::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -38,6 +46,10 @@ pub struct BatchInserter {
     hash_registries: Vec<HashRegistry>,
     column_mapper: ColumnGroupMapper,
     base_path: PathBuf,
+    level_map: Arc<LevelMap>,
+    patch_log: Arc<PatchLog>,
+    chunk_cache: Arc<ChunkCache>,
+    compaction_lock: Arc<CompactionLock>,
 }
 
 impl BatchInserter {
@@ -45,6 +57,10 @@ impl BatchInserter {
         config: TableConfig,
         catalog: Arc<VersionCatalog>,
         catalog_db: Arc<sled::Db>,
+        level_map: Arc<LevelMap>,
+        patch_log: Arc<PatchLog>,
+        chunk_cache: Arc<ChunkCache>,
+        compaction_lock: Arc<CompactionLock>,
     ) -> Self {
         // Create hash registries for each hash dimension
         let hash_registries: Vec<HashRegistry> = config.partitioning.hash_dimensions.iter()
@@ -67,6 +83,10 @@ impl BatchInserter {
             hash_registries,
             column_mapper,
             base_path,
+            level_map,
+            patch_log,
+            chunk_cache,
+            compaction_lock,
         }
     }
 
@@ -93,10 +113,14 @@ impl BatchInserter {
         // Update range dimension statistics
         self.update_range_stats(batch)?;
 
-        // Group rows by coordinate (for each column group)
+        // Group rows by coordinate (for each column group).
+        // The row cell comes from the level map: level 0 by formula unless the
+        // cell has been split, in which case routing descends to the leaf.
+        // One routing guard for the whole batch (not a lock per row).
+        let router = self.level_map.routing();
         for row_idx in 0..num_rows {
             let row_id = row_ids[row_idx];
-            let row_bucket_idx = row_bucket(row_id, self.config.partitioning.chunk_rows);
+            let (level, row_bucket_idx) = router.route(row_id);
 
             let hash_buckets: Vec<u64> = hash_buckets_per_row.iter()
                 .map(|dim_buckets| dim_buckets[row_idx])
@@ -108,8 +132,9 @@ impl BatchInserter {
 
             // Create coordinate for each column group
             for col_group in 0..self.column_mapper.num_groups() {
-                let coord = ChunkCoordinate::new(
+                let coord = ChunkCoordinate::new_at_level(
                     row_bucket_idx,
+                    level,
                     col_group,
                     hash_buckets.clone(),
                     range_buckets.clone(),
@@ -117,8 +142,14 @@ impl BatchInserter {
                 grouper.add_row(coord, row_idx);
             }
         }
+        // Release the read lock before any split: mark_refined takes the
+        // write lock on the same RwLock and would deadlock on this thread.
+        drop(router);
 
         // 2. Write chunks (with merge-on-write to prevent row loss)
+        // Track the largest file written per row cell to drive split checks.
+        let mut cell_peak_rows: HashMap<(u16, u64), usize> = HashMap::new();
+
         for (coord, row_indices) in grouper.groups {
             // Get columns for this column group
             let group_columns = self.column_mapper.get_columns_in_group(coord.col_group);
@@ -166,11 +197,178 @@ impl BatchInserter {
 
             // Update catalog
             self.catalog.update_version(&self.config.name, &coord, version)?;
+
+            // Merge-on-write rewrote this row cell: a warm cache entry would
+            // serve the pre-insert batch (patch-delta logic only tracks
+            // patches, not new base files).
+            self.chunk_cache.invalidate(&RowKey::from(&coord).cache_key(&self.config.name));
+
+            let cell = (coord.level, coord.row_bucket);
+            let peak = cell_peak_rows.entry(cell).or_insert(0);
+            *peak = (*peak).max(final_batch.num_rows());
         }
 
         self.catalog.flush()?;
 
+        // 3. Adaptive grid: split every row cell whose largest file overflowed.
+        if let Some(max_cell_rows) = self.config.partitioning.max_cell_rows {
+            let base_width = self.config.partitioning.chunk_rows;
+            let mut worklist: Vec<(u16, u64)> = cell_peak_rows.iter()
+                .filter(|(_, &rows)| rows as u64 > max_cell_rows)
+                .map(|(&cell, _)| cell)
+                .collect();
+
+            while let Some((level, bucket)) = worklist.pop() {
+                if !cell_is_splittable(bucket, base_width, level) {
+                    continue;
+                }
+                let children = self.split_cell(level, bucket)?;
+                for (child_cell, child_rows) in children {
+                    if child_rows as u64 > max_cell_rows {
+                        worklist.push(child_cell);
+                    }
+                }
+            }
+        }
+
         Ok(version)
+    }
+
+    /// Split row cell (level, bucket) in half along the row dimension.
+    ///
+    /// All coordinates sharing the cell (every hash/range/column-group combo)
+    /// split together — vertical join groups by RowKey, so the row-axis
+    /// partitioning must stay uniform across column groups. Pending patches
+    /// are applied first (compact-on-split): children are born clean.
+    /// Returns the child cells created with the largest file size of each.
+    fn split_cell(&self, level: u16, bucket: u64) -> Result<Vec<((u16, u64), usize)>> {
+        let table = &self.config.name;
+        let base_width = self.config.partitioning.chunk_rows;
+        let parent_key = patch_key(table, level, bucket);
+
+        // Mutual exclusion with the compactor on this cell. If it holds the
+        // lock, skip: the cell stays oversized and the next insert touching
+        // it retries the split.
+        let _cell_guard = match self.compaction_lock.try_acquire(&parent_key) {
+            Some(guard) => guard,
+            None => return Ok(vec![]),
+        };
+
+        // Patches up to this snapshot are folded into the children; newer
+        // ones are re-routed to the child keys afterwards.
+        let snapshot_tx = self.catalog.current_transaction_id();
+        let patches = self.patch_log.get_patches_up_to(&parent_key, snapshot_tx);
+
+        let parents = self.catalog.chunks_for_cell(table, level, bucket)?;
+        if parents.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let child_level = level + 1;
+        let new_version = self.catalog.next_transaction_id()?;
+        let mut child_entries: Vec<(ChunkCoordinate, u64)> = vec![];
+        let mut child_peak_rows: HashMap<(u16, u64), usize> = HashMap::new();
+
+        for (parent_coord, parent_version) in &parents {
+            let path = chunk_path(&self.base_path, table, parent_coord, *parent_version);
+            if !path.exists() {
+                continue;
+            }
+            let base = Self::read_parquet_file(&path)?;
+            let clean = if patches.is_empty() {
+                base
+            } else {
+                // Chunk files hold __row_id + one column group; patch batches
+                // carry the full table schema. Project before applying.
+                let projected = project_patches_to_schema(&patches, &base.schema())?;
+                apply_patches(base, &projected)?
+            };
+
+            for (child_bucket, child_batch) in
+                partition_by_child_bucket(&clean, base_width, child_level)?
+            {
+                let child_coord = parent_coord.child(child_bucket);
+                let child_path = chunk_path(&self.base_path, table, &child_coord, new_version);
+                write_parquet(&child_path, &child_batch, None)?;
+
+                let cell = (child_level, child_bucket);
+                let peak = child_peak_rows.entry(cell).or_insert(0);
+                *peak = (*peak).max(child_batch.num_rows());
+                child_entries.push((child_coord, new_version));
+            }
+        }
+
+        // Atomic commit: children in, parents out, level map persisted. The
+        // in-memory map is marked refined only after the commit succeeds — a
+        // failed commit must leave routing on the (still live) parent.
+        let parent_coords: Vec<ChunkCoordinate> =
+            parents.iter().map(|(c, _)| c.clone()).collect();
+        self.catalog.commit_split(
+            table,
+            &parent_coords,
+            &child_entries,
+            &self.level_map.snapshot_with((level, bucket)),
+        )?;
+        // Barrier: takes the level-map write lock, so every writer that
+        // routed to the parent under a RoutingGuard has finished recording
+        // its patches before this returns.
+        self.level_map.mark_refined(level, bucket);
+
+        // The parent key is frozen after mark_refined (writers route to the
+        // children now), so read → re-route → clear is race-free. The order
+        // matters for WAL crash safety: child records are appended before
+        // the parent's Clear, so a crash in between at worst replays a patch
+        // on both keys — Update/Delete are idempotent, and parent-key
+        // leftovers are inert (no chunks exist at the parent cell).
+        // Entries <= snapshot_tx are already materialized in the children.
+        for entry in self.patch_log.get_patches(&parent_key) {
+            if entry.tx_id <= snapshot_tx {
+                continue;
+            }
+            match entry.op {
+                PatchOp::Delete(ids) => {
+                    let mut by_child: HashMap<u64, Vec<u64>> = HashMap::new();
+                    for id in ids {
+                        by_child.entry(bucket_at_level(id, base_width, child_level))
+                            .or_default().push(id);
+                    }
+                    for (child_bucket, ids) in by_child {
+                        let key = patch_key(table, child_level, child_bucket);
+                        self.patch_log.record(&key, entry.tx_id, PatchOp::Delete(ids))?;
+                    }
+                }
+                PatchOp::Update(batch) => {
+                    self.reroute_patch_batch(&batch, entry.tx_id, child_level, PatchOp::Update)?;
+                }
+                PatchOp::Insert(batch) => {
+                    self.reroute_patch_batch(&batch, entry.tx_id, child_level, PatchOp::Insert)?;
+                }
+            }
+        }
+        self.patch_log.clear_patches(&parent_key)?;
+
+        // Cached batches for the parent RowKeys are now dead.
+        for coord in &parent_coords {
+            self.chunk_cache.invalidate(&RowKey::from(coord).cache_key(table));
+        }
+
+        Ok(child_peak_rows.into_iter().collect())
+    }
+
+    /// Re-route one batch-carrying patch to the child cells it belongs to.
+    fn reroute_patch_batch(
+        &self,
+        batch: &RecordBatch,
+        tx_id: u64,
+        child_level: u16,
+        make_op: fn(RecordBatch) -> PatchOp,
+    ) -> Result<()> {
+        let base_width = self.config.partitioning.chunk_rows;
+        for (child_bucket, sub) in partition_by_child_bucket(batch, base_width, child_level)? {
+            let key = patch_key(&self.config.name, child_level, child_bucket);
+            self.patch_log.record(&key, tx_id, make_op(sub))?;
+        }
+        Ok(())
     }
 
     fn get_or_generate_row_ids(&self, batch: &RecordBatch, num_rows: usize) -> Result<Vec<u64>> {
@@ -421,6 +619,52 @@ impl BatchInserter {
         UInt64Array::from_iter_values(indices.iter().map(|&i| values[i]))
     }
 
+}
+
+/// Partition a batch (must contain a UInt64 `__row_id` column) into its child
+/// row cells at `child_level`. Returns only non-empty children — one or two.
+fn partition_by_child_bucket(
+    batch: &RecordBatch,
+    base_width: u64,
+    child_level: u16,
+) -> Result<Vec<(u64, RecordBatch)>> {
+    use arrow::array::BooleanArray;
+
+    if batch.num_rows() == 0 {
+        return Ok(vec![]);
+    }
+
+    let row_id_idx = batch.schema().index_of("__row_id")?;
+    let row_ids = batch.column(row_id_idx).as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| crate::ChunkDbError::Config("__row_id must be UInt64".to_string()))?;
+
+    let buckets: Vec<u64> = row_ids.values().iter()
+        .map(|&id| bucket_at_level(id, base_width, child_level))
+        .collect();
+
+    // A parent cell has exactly two children (2b and 2b+1), so min/max are
+    // the only possible values; anything in between would mean the batch was
+    // routed inconsistently.
+    let min_bucket = *buckets.iter().min().unwrap();
+    let max_bucket = *buckets.iter().max().unwrap();
+    debug_assert!(buckets.iter().all(|&b| b == min_bucket || b == max_bucket));
+
+    if min_bucket == max_bucket {
+        return Ok(vec![(min_bucket, batch.clone())]);
+    }
+
+    let left_mask = BooleanArray::from(
+        buckets.iter().map(|&b| b == min_bucket).collect::<Vec<bool>>()
+    );
+    let right_mask = arrow::compute::not(&left_mask)?;
+    Ok(vec![
+        (min_bucket, filter_batch(batch, &left_mask)?),
+        (max_bucket, filter_batch(batch, &right_mask)?),
+    ])
+}
+
+impl BatchInserter {
     fn take_array(&self, array: &ArrayRef, indices: &[usize]) -> Result<ArrayRef> {
         let indices_arr = UInt64Array::from_iter_values(indices.iter().map(|&i| i as u64));
 
