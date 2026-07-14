@@ -182,12 +182,15 @@ next level, repeat; every step is a formula, the map only says where to stop.
 
 ## 7. Phased plan
 
-> Status (2026-07-08): Phase 2 shipped as release 0.2
+> Status (2026-07-12): **Phase 1 and Phase 2 are complete.** Phase 2 shipped
+> as release 0.2
 > ([release-0.2-adaptive-row-grid.md](release-0.2-adaptive-row-grid.md), zone
 > maps deferred to Phase 3); the durability half of Phase 1 shipped as
 > release 0.3 ([release-0.3-patch-wal.md](release-0.3-patch-wal.md),
-> WAL-backed PatchLog). Remaining from Phase 1: queryable hot buffer +
-> insert-side WAL.
+> WAL-backed PatchLog); the queryable hot buffer + insert-side WAL (plus
+> orphan-file GC) shipped as release 0.4
+> ([release-0.4-hot-buffer-gc.md](release-0.4-hot-buffer-gc.md)). Next up:
+> Phase 3.
 
 1. **WAL + queryable hot buffer.** Self-contained; fixes durability (the most
    serious v0 gap) and delivers the "insert → instantly queryable" demo.

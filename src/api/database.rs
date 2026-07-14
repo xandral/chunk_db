@@ -161,6 +161,23 @@ impl ChunkDb {
         inserter.insert(batch)
     }
 
+    /// Buffered insert (hot buffer): the batch is fsynced to the WAL and
+    /// immediately visible to queries, but not yet materialized to Parquet.
+    /// Much cheaper than `insert` (no merge-on-write); materialize with
+    /// `flush_hot_buffer` / `compact`, or via a `stream_inserter` threshold.
+    pub fn insert_buffered(&self, table_name: &str, batch: &RecordBatch) -> Result<u64> {
+        let inserter = self.inserter(table_name)?;
+        inserter.buffer_insert(batch)
+    }
+
+    /// Materialize the table's hot buffer into chunk files through the normal
+    /// insert path (merge-on-write, adaptive-grid splits included). Returns
+    /// the version written, or None if the buffer was empty.
+    pub fn flush_hot_buffer(&self, table_name: &str) -> Result<Option<u64>> {
+        let inserter = self.inserter(table_name)?;
+        inserter.flush_hot()
+    }
+
     /// Create a direct executor for a table (internal use)
     ///
     /// PERF: Clones config, hash_registries, and column_mapper on every query.
@@ -201,6 +218,10 @@ impl ChunkDb {
         let table_state = self.tables.get(table_name)
             .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
 
+        // Cell patches only reach materialized rows — flush the hot buffer
+        // first so buffered rows can be deleted too.
+        self.flush_hot_buffer(table_name)?;
+
         let tx_id = self.version_catalog.next_transaction_id()?;
 
         // Group row_ids by leaf row cell. The routing guard stays alive until
@@ -226,6 +247,10 @@ impl ChunkDb {
     pub fn update_rows(&self, table_name: &str, batch: &RecordBatch) -> Result<u64> {
         let table_state = self.tables.get(table_name)
             .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
+
+        // Cell patches only reach materialized rows — flush the hot buffer
+        // first so buffered rows can be updated too.
+        self.flush_hot_buffer(table_name)?;
 
         let tx_id = self.version_catalog.next_transaction_id()?;
 
@@ -253,8 +278,11 @@ impl ChunkDb {
         Ok(tx_id)
     }
 
-    /// Run compaction on all dirty chunks for a table
+    /// Run compaction on all dirty chunks for a table. Also materializes the
+    /// hot buffer first, so "after compact everything lives in Parquet and
+    /// the WAL is empty" stays true.
     pub fn compact(&self, table_name: &str) -> Result<crate::write::CompactionResult> {
+        self.flush_hot_buffer(table_name)?;
         let compactor = crate::write::Compactor::new(
             &self.version_catalog,
             &self.patch_log,
@@ -278,6 +306,52 @@ impl ChunkDb {
         Ok(chunks.iter()
             .map(|(coord, version)| crate::storage::format_chunk_filename(coord, *version))
             .collect())
+    }
+
+    /// Delete orphaned chunk files: superseded versions and pre-split parents
+    /// no longer referenced by the catalog. Files younger than `min_age` are
+    /// kept — a concurrent insert writes its Parquet before registering it in
+    /// the catalog, so a fresh unreferenced file may simply not be committed
+    /// yet. Maintenance operation: a long-running query that snapshotted its
+    /// chunk list before the GC can fail if its files are collected under it.
+    pub fn collect_garbage(&self, table_name: &str, min_age: std::time::Duration) -> Result<GcResult> {
+        use std::collections::HashSet;
+
+        let chunks_dir = self.base_path.join(table_name).join("chunks");
+        if !chunks_dir.exists() {
+            return Ok(GcResult::default());
+        }
+
+        // Directory listing first, live set second: anything committed after
+        // the listing isn't in it, so it can't be deleted by mistake.
+        let entries: Vec<_> = std::fs::read_dir(&chunks_dir)?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let live: HashSet<String> = self.live_chunk_files(table_name)?.into_iter().collect();
+
+        let now = std::time::SystemTime::now();
+        let mut result = GcResult::default();
+
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".parquet") || live.contains(&name) {
+                continue;
+            }
+
+            let meta = entry.metadata()?;
+            let age = meta.modified().ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .unwrap_or_default();
+            if age < min_age {
+                result.files_kept_young += 1;
+                continue;
+            }
+
+            std::fs::remove_file(entry.path())?;
+            result.files_removed += 1;
+            result.bytes_reclaimed += meta.len();
+        }
+
+        Ok(result)
     }
 
     /// Create a streaming inserter that buffers small batches and flushes
@@ -342,6 +416,15 @@ impl ChunkDb {
 
         CompactionHandle::new(shutdown, trigger, join_handle)
     }
+}
+
+/// Outcome of a `collect_garbage` run
+#[derive(Debug, Default)]
+pub struct GcResult {
+    pub files_removed: usize,
+    pub bytes_reclaimed: u64,
+    /// Unreferenced files skipped because they were younger than `min_age`
+    pub files_kept_young: usize,
 }
 
 /// Builder for creating tables programmatically
@@ -472,6 +555,13 @@ impl TableBuilder {
 /// Build a patch key from table name and row cell (level + bucket)
 pub(crate) fn patch_key(table_name: &str, level: u16, row_bucket: u64) -> Vec<u8> {
     format!("patch:{}:{}:{}", table_name, level, row_bucket).into_bytes()
+}
+
+/// Patch-log key holding a table's hot buffer (WAL-backed buffered inserts).
+/// Deliberately outside the `patch:` namespace: the compactor's per-cell walk
+/// skips it, and no cell scan ever applies it as a chunk patch.
+pub(crate) fn hot_buffer_key(table_name: &str) -> Vec<u8> {
+    format!("hot:{}", table_name).into_bytes()
 }
 
 /// Extract specific rows from a RecordBatch by index

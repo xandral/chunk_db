@@ -52,7 +52,8 @@ Every Parquet file on disk is identified by a 4D coordinate:
 
 ```
 ChunkCoordinate {
-    row_bucket:    u64,        // row_id / chunk_rows
+    row_bucket:    u64,        // floor(row_id · 2^level / chunk_rows)
+    level:         u16,        // adaptive row grid refinement level (0 = base grid)
     col_group:     u16,        // which column subset
     hash_buckets:  Vec<u64>,   // one per hash dimension
     range_buckets: Vec<u64>,   // one per range dimension
@@ -67,8 +68,13 @@ determined by the **intersection** of all dimensions. For example, with
 (row_bucket, hash_bucket, ...) — but if a particular sensor only appears 200
 times in that row bucket, the resulting Parquet file will contain only 200 rows,
 not 100,000. This **small files problem** is inherent to multi-dimensional
-partitioning and is a known area for future optimization (see
-[Known issues](#known-issues-and-limitations)).
+partitioning. On the row axis it is addressed by the **adaptive row grid**
+(release 0.2): with `.max_cell_rows(n)` set, a coarse base grid refines itself
+by splitting overflowing cells in half (geohash/quadtree style — the `level`
+field above), so granularity follows the data instead of being guessed at
+setup time. Hash and range dimensions do not split yet (see
+[Known issues](#known-issues-and-limitations) and
+[docs/architecture-evolution.md](docs/architecture-evolution.md)).
 
 
 
@@ -90,6 +96,15 @@ This preserves the natural ordering of the original values, including negative
 ones (e.g., dates before 1970-01-01). With `chunk_rows = 100_000` and a
 timestamp-based row ID, rows with nearby timestamps land in the same bucket,
 providing temporal locality.
+
+With the adaptive row grid enabled (`.max_cell_rows(n)`), a cell whose chunk
+file exceeds `n` rows is split in half along the row axis
+(`row_bucket = floor(row_id · 2^level / chunk_rows)`, children `2b`/`2b+1` at
+`level+1`), recursively. Pending patches are applied during the split
+(compact-on-split), and the per-table set of refined cells (the level map) is
+snapshotted in the catalog. Without `max_cell_rows` the grid is fixed at
+level 0 — exactly the formula above. See
+[docs/release-0.2-adaptive-row-grid.md](docs/release-0.2-adaptive-row-grid.md).
 
 ### 2. Column groups (vertical partitioning)
 
@@ -140,12 +155,15 @@ buckets, and only those chunks are read.
 │   ├── chunks/
 │   │   ├── chunk_r0_c0_h7_rg4610_v1.parquet
 │   │   ├── chunk_r0_c1_h7_rg4610_v1.parquet
-│   │   ├── chunk_r1_c0_h3_rg4611_v2.parquet
+│   │   ├── chunk_r5_l2_c0_h3_rg4611_v2.parquet   <-- split cell (level 2)
 │   │   └── ...
-│   └── catalog/    <-- sled KV store
+├── catalog/             <-- sled KV store
+├── wal/
+│   └── patches.wal      <-- write-ahead log (updates/deletes + hot buffer)
 ```
 
-Filename format: `chunk_r{row}_c{col}_h{hash0}-{hash1}_rg{range0}_v{version}.parquet`
+Filename format: `chunk_r{row}[_l{level}]_c{col}_h{hash0}-{hash1}_rg{range0}_v{version}.parquet`
+(`_l` omitted at level 0).
 
 ---
 
@@ -222,7 +240,37 @@ let rows = db.select(&["timestamp", "value"])
 ```
 
 Table configurations persist in the catalog. On restart, `ChunkDb::open`
-reloads all tables automatically.
+reloads all tables automatically (and replays the WAL — see below).
+
+### Mutations and the hot buffer
+
+```rust
+// Update rows (batch must carry __row_id + all table columns) and delete by
+// __row_id. Both are journaled as patches (fsynced to the WAL, applied
+// merge-on-read) — no Parquet rewrite until compaction.
+db.update_rows("events", &updated_batch)?;
+db.delete_rows("events", &[row_id_a, row_id_b])?;
+db.compact("events")?;              // materialize patches, truncate the WAL
+
+// Buffered insert: fsynced to the WAL and immediately queryable, but not yet
+// materialized to Parquet — much cheaper than insert() for small batches.
+db.insert_buffered("events", &batch)?;
+db.flush_hot_buffer("events")?;     // materialize (merge-on-write)
+
+// StreamInserter writes through the hot buffer: every write() is durable and
+// queryable at once; the buffer is materialized at the row threshold.
+let mut stream = db.stream_inserter("events", StreamConfig::default())?;
+stream.write(&batch)?;
+stream.close()?;
+
+// Remove superseded chunk versions / pre-split parents from disk.
+db.collect_garbage("events", std::time::Duration::from_secs(60))?;
+```
+
+Everything acknowledged by these calls survives a crash: patches and buffered
+inserts are replayed from the WAL on `open`. See
+[docs/release-0.3-patch-wal.md](docs/release-0.3-patch-wal.md) and
+[docs/release-0.4-hot-buffer-gc.md](docs/release-0.4-hot-buffer-gc.md).
 
 ---
 
@@ -317,14 +365,25 @@ db.insert("events", &batch)
   -> generate __row_id (based on strategy)
   -> compute hash_bucket per row (xxh3 % N)
   -> compute range_bucket per row (div_euclid)
-  -> compute row_bucket per row (row_id / chunk_rows)
-  -> group rows by (row_bucket, col_group, hash_buckets, range_buckets)
+  -> route row cell via the level map (level 0 formula unless the cell split)
+  -> group rows by (row_bucket, level, col_group, hash_buckets, range_buckets)
   -> for each coordinate:
        if coordinate already exists in catalog:
-         read existing parquet, concat new rows (merge-on-write)
+         read existing parquet, concat, dedup by __row_id (merge-on-write)
        write parquet file (SNAPPY compressed)
        update catalog version
   -> flush catalog
+  -> adaptive grid: split any row cell whose file exceeded max_cell_rows
+
+db.insert_buffered / StreamInserter::write
+  -> assign __row_id, fsync the batch to the WAL (hot buffer)
+  -> visible to queries immediately; materialized through db.insert's path
+     at flush (threshold / flush_hot_buffer / compact)
+
+db.update_rows / db.delete_rows
+  -> flush the hot buffer, route by row cell
+  -> fsync a patch record to the WAL (no Parquet rewrite)
+  -> applied merge-on-read at query time; materialized by compaction/splits
 ```
 
 ### Read path
@@ -335,12 +394,15 @@ db.select(...).filter(...).execute()
   -> prune_chunks():
        load all coordinates from catalog
        eliminate by hash, range, column group, version
-  -> group surviving chunks by RowKey (row_bucket + hash + range)
+  -> group surviving chunks by RowKey (row_bucket + level + hash + range)
   -> parallel scan (Tokio async + Rayon):
        for each RowKey:
+         chunk cache hit? serve cached batch (+ patch delta)
          read parquet files (one per required column group)
          if multiple groups: vertical_join on __row_id
+         apply pending patches up to the query snapshot (merge-on-read)
          apply row-level filters
+  -> union the hot buffer (filtered, deduplicated by __row_id)
   -> apply final projection (remove filter-only columns)
   -> return Vec<RecordBatch>
 ```
@@ -372,6 +434,12 @@ Backed by [sled](https://github.com/spacejam/sled) (embedded persistent KV store
 | `__next_row_id__` | Snowflake allocator |
 | `__table_config__<name>` | Persisted TableConfig |
 | `__range_stats__<table>_<col>` | Global min/max per range dimension |
+| level map snapshot per table | Refined cells of the adaptive row grid |
+
+Updates, deletes and the hot buffer live in the WAL-backed `PatchLog`
+(`wal/patches.wal`): every mutation is fsynced before it is acknowledged,
+replayed on `open`, checkpointed at open, and truncated once compaction or
+splits materialize everything.
 
 ---
 
@@ -379,27 +447,39 @@ Backed by [sled](https://github.com/spacejam/sled) (embedded persistent KV store
 
 ```
 src/
-  api/database.rs          ChunkDb (main handle), create_table, insert, select
+  api/database.rs          ChunkDb (main handle): tables, mutations, GC, queries
   config/table_config.rs   TableConfig, TableBuilder, RowIdStrategy
   catalog/
-    version_catalog.rs     Sled-backed version tracking, row ID allocation
+    version_catalog.rs     Sled-backed version tracking, row ID allocation,
+                           level map snapshots, atomic split commit
     hash_registry.rs       xxh3 hash bucketing
     range_stats.rs         Global min/max statistics per range dimension
   storage/
-    chunk_coord.rs         ChunkCoordinate, ChunkInfo
+    chunk_coord.rs         ChunkCoordinate (incl. level), ChunkInfo
     chunk_naming.rs        Filename format/parse, chunk_path()
     parquet_writer.rs      write_parquet() (SNAPPY)
+    chunk_cache.rs         In-memory cache of merged chunks (per tx snapshot)
   partitioning/
-    row_index.rs           row_bucket = row_id / chunk_rows
+    row_index.rs           bucket_at_level(), cell_row_range(), split math
+    level_map.rs           Adaptive row grid: refined cells + routing guard
     range_dim.rs           range_bucket(), overlapping_buckets()
     column_groups.rs       ColumnGroupMapper
+  concurrency/
+    compaction_lock.rs     Per-cell mutual exclusion (splits vs compaction)
   write/
-    batch_insert.rs        BatchInserter (full write pipeline, merge-on-write)
+    batch_insert.rs        BatchInserter: write pipeline, merge-on-write,
+                           cell splits, hot buffer (buffer_insert/flush_hot)
+    stream_insert.rs       StreamInserter over the hot buffer
+    patch_log.rs           PatchLog: update/delete/insert journal
+    patch_wal.rs           WAL backing the PatchLog (fsync, replay, checkpoint)
+    patch_apply.rs         Merge-on-read patch application + projection
+    compaction.rs          Compactor: base + patches -> clean new version
+    auto_compaction.rs     Background compaction task
   query/
     filter.rs              Filter, FilterOp, FilterValue, CompositeFilter (OR)
-    pruning.rs             Chunk-level pruning, row-group pruning
+    pruning.rs             Chunk-level pruning (level-aware), row-group pruning
     query_builder.rs       Fluent API (select/filter/count/sum/...)
-    direct_executor.rs     Query execution, row-level filtering, parquet read
+    direct_executor.rs     Query execution, patches, hot-buffer union, filters
     chunk_merger.rs        RowKey grouping, vertical_join, OR deduplication
 ```
 
@@ -422,7 +502,7 @@ src/
 ## Tests and examples
 
 ```bash
-cargo test                                      # 18 tests (15 unit + 3 integration)
+cargo test                                      # 78 tests (60 unit + 18 integration)
 cargo run --example playground --release        # interactive demo
 cargo run --example query_benchmark --release   # simple query benchmark
 
@@ -462,17 +542,25 @@ See [`benchmarks/README.md`](benchmarks/README.md) for full documentation, param
 
 ### Test coverage
 
-| Test | Count | Covers |
-|---|---|---|
-| Unit tests (inline) | 15 | Range bucketing (positive, negative, cross-zero, ordering), chunk filename parse/format, range stats, i64→u64 order-preserving mapping |
-| `test_comprehensive_scenarios` | 1 | Multi-batch insert, hash/row bucket pruning, all filter ops, aggregations, projections, OR conditions, limit, empty results |
-| `test_column_groups` | 1 | Vertical partitioning, multi-group vertical join, column projection across groups |
-| `test_negative_timestamps` | 1 | Negative primary keys, range dimension with negative values, cross-zero queries |
+| Area | Covers |
+|---|---|
+| Unit tests (inline, 60) | Bucketing math incl. levels and negatives, filename parse/format round-trip, level map routing/snapshots, patch log + WAL replay/truncation/corrupt tail, patch application and projection, cache, range stats |
+| Query/write integration | Multi-batch insert, pruning, all filter ops, aggregations, projections, OR, limit, column groups + vertical join, negative timestamps |
+| Mutations & durability | Updates/deletes with snapshot isolation, compaction (incl. newer-patch preservation), WAL replay across reopen, hot buffer visibility/durability/flush, GC of superseded files |
+| Adaptive grid | Split on overflow, compact-on-split, reopen with level map, column-group updates across split/compaction |
 
 ---
 
 
 ## Configuration tuning
+
+> **Note (2026-07):** the adaptive row grid makes most of the manual tuning
+> below unnecessary on the row axis — set a coarse `chunk_rows` plus
+> `.max_cell_rows(n)` and let cells split where data is dense. The guidelines
+> below still apply to hash/range dimensions (which do not split yet) and to
+> tables running with the fixed grid. Per the agreed direction
+> ([docs/architecture-evolution.md](docs/architecture-evolution.md)) this
+> whole section is slated for obsolescence.
 
 Performance appears to be sensitive to chunking parameters. Since dimensions
 interact (the actual chunk content is the intersection of all dimension
@@ -563,162 +651,50 @@ to store separately blocks of columns.
 
 ### Open issues
 
-1. **Small files problem** — Multi-dimensional partitioning can produce many tiny Parquet files. When a hash bucket contains few rows in a given row bucket, the resulting file may hold only tens or hundreds of rows instead of `chunk_rows`. This causes excessive file opening overhead and poor I/O utilization. Future optimization: aggregate small chunks during compaction or use adaptive bucketing.
-2. **No stale file cleanup** — Old version files accumulate on disk (manual cleanup required).
+1. **Small files problem (hash/range axes)** — the adaptive row grid (0.2) fixes this on the row axis, but hash and range dimensions still partition with a fixed modulo/width: a rare hash value in a given row cell still produces a tiny file. Multi-dimensional splits (extendible hashing) are Phase 3 of [docs/architecture-evolution.md](docs/architecture-evolution.md).
+2. **GC is manual** — `collect_garbage()` removes superseded versions and pre-split parents, but nothing schedules it; and a long-running query that snapshotted its chunk list before a GC can fail if its files are collected under it.
 3. **Hardcoded concurrency** — Semaphore limit (128) not configurable.
 4. **Silent type fallback in `parse_data_type()`** — Unknown type strings fall back to Utf8 instead of returning an error.
 5. **Hash bucketing limited to Utf8 and Int64** — Other column types (UInt64, Float64) silently assign bucket 0, disabling hash pruning for those types.
-6. **Catalog scan on every query** — `all_chunks()` performs an O(n) scan of the sled catalog. Acceptable for moderate data sizes; needs caching at scale.
+6. **Catalog scan on every query** — `all_chunks()` performs an O(n) scan of the sled catalog (mitigated by an in-memory chunk index). Level-aware descent is planned to replace it.
+7. **Chunk files ride the OS page cache** — Parquet writes and the sled catalog are not fsynced per insert; an acknowledged `insert()` can be lost on power failure (not on process crash). `insert_buffered` (WAL-backed) is the durable path; a chunk-file fsync policy is future work.
 
 
 
 ### Limitations
 
-- **Experimental status**: This is a research prototype. APIs and storage format may change between versions. Expect undiscovered bugs — the project is under active development and has not been battle-tested in production.
-- **No updates/deletes**: Append-only. Workaround: write new versions with updated data.
-- **Dimension interaction**: Chunk dimensions are not independent in practice — the actual chunk size is the intersection of all dimensions, which can produce many undersized files (see issue #1 above).
+- **Experimental status**: This is a research prototype. APIs and storage format may change between versions (0.2 broke the catalog format, no migration). Expect undiscovered bugs — the project is under active development and has not been battle-tested in production.
+- **Updates/deletes are patch-based**: `update_rows`/`delete_rows` journal patches applied merge-on-read; heavy un-compacted patch volume slows reads until compaction. Updates must carry the full table schema.
+- **Dimension interaction**: Chunk dimensions are not independent in practice — the actual chunk size is the intersection of all dimensions, which can produce many undersized files on the hash/range axes (see issue #1 above).
 - **OR conditions**: Fully implemented but may read duplicate chunks (deduplication happens post-read).
 - **String filters**: Only `Eq` and `NotEq` have row-level implementations. Other operators return errors.
 - **No distributed mode**: Single-node only. Catalog is local sled DB.
-- **No transaction isolation**: Concurrent writes to same coordinate use merge-on-write, but reads may see partial writes.
+- **Snapshot isolation is patch-level only**: queries see patches up to their snapshot transaction, but concurrent merge-on-write inserts to the same coordinate are visible as soon as the catalog version bumps.
 - **Batch-in-memory reads**: Queries currently materialize all matching chunks into `Vec<RecordBatch>` in memory before returning. For large result sets this can cause high memory usage. A streaming approach (returning an async `RecordBatchStream` that yields batches lazily as chunks are read) is planned but not yet implemented.
 - **Query API surface**: The current filter API (`Filter::eq`, `Filter::between`, `.or()`) covers common cases but remains low-level and verbose for complex predicates. A future goal is to simplify the API (e.g., more ergonomic compound filters, builder-style predicates) and extend operator coverage (e.g., `IN`, `LIKE`, range operators on strings). This is not urgent but would improve usability.
 
 
-## Roadmap
+## Status and roadmap
 
-### Phase 1 — Patch log with WAL (update/delete support)
+The agreed target architecture is the **hierarchical adaptive grid**
+("geohash for tables") described in
+[docs/architecture-evolution.md](docs/architecture-evolution.md) — read that
+before proposing structural changes. Progress against its phased plan:
 
-ChunkDB is currently append-only with merge-on-write. The next step introduces a **patch log** backed by a write-ahead log (WAL) to support updates, deletes, and efficient partial mutations.
+| Phase | Content | Status |
+|---|---|---|
+| 1 | WAL-backed PatchLog (durable updates/deletes) | ✅ release 0.3 — [docs/release-0.3-patch-wal.md](docs/release-0.3-patch-wal.md) |
+| 1 | Queryable hot buffer + insert-side WAL, orphan GC | ✅ release 0.4 — [docs/release-0.4-hot-buffer-gc.md](docs/release-0.4-hot-buffer-gc.md) |
+| 2 | Adaptive row grid (`level` in coordinates, split-on-overflow, compact-on-split) | ✅ release 0.2 — [docs/release-0.2-adaptive-row-grid.md](docs/release-0.2-adaptive-row-grid.md) |
+| 3 | Multi-dimension splits (extendible hashing), merge of undersized cells, in-file sort + bloom filters, zone maps | ⏳ next |
+| 4 | Workload-driven splits (qd-tree style) | optional / research |
 
-**Design**:
+Earlier releases also shipped an in-memory chunk cache and background
+auto-compaction. The 0.2 code review and its gap analysis live in
+[docs/review-0.2-code-review.md](docs/review-0.2-code-review.md).
 
-```
-Write path (current):
-  INSERT batch → group by coordinate → merge-on-write → new Parquet version
-
-Write path (proposed):
-  INSERT/UPDATE/DELETE → append to WAL → write patch entry to patch log
-                                          │
-                                          ├─ patch type: Insert / Update / Delete
-                                          ├─ affected __row_ids
-                                          ├─ new values (for update)
-                                          └─ target ChunkCoordinate
-```
-
-Patches would be lightweight journal entries (not full Parquet rewrites), accumulating in memory and on disk until compaction materializes them.
-
-**Patch application has two modes**:
-
-1. **On-the-fly at read time (merge-on-read)**: When a `SELECT` reads a chunk, pending patches for that coordinate are applied in-flight before returning results. Deletes are filtered out, updates overwrite values, inserts are appended. This avoids write amplification and provides immediate consistency without compaction.
-
-2. **At compaction time**: A background (or manual) compaction job reads a chunk's base Parquet file, applies all accumulated patches, writes a new clean Parquet version, and truncates the patch log. This reduces read-time overhead and reclaims space from deleted rows.
-
-```
-Read path (proposed):
-  SELECT → prune_chunks()
-        → for each chunk:
-            read base Parquet file
-            check patch log for pending patches on this coordinate
-            if patches exist:
-              apply deletes (filter out __row_ids)
-              apply updates (overwrite columns by __row_id)
-              apply inserts (append rows)
-            return merged RecordBatch
-
-Compaction:
-  for each coordinate with accumulated patches:
-    read base Parquet + all patches
-    materialize into new Parquet version
-    truncate applied patches from WAL
-    update catalog version
-```
-
-**Why merge-on-read over merge-on-write for mutations**: The current merge-on-write strategy (read existing Parquet, concat, dedup, rewrite) works for bulk inserts but causes write amplification for small updates. Merge-on-read defers the cost to query time, which may be acceptable when patches are small relative to chunk size. Compaction would amortize the cost over time. The trade-offs between these approaches need further investigation.
-
-### Phase 2 — In-memory chunk cache
-
-Add an LRU cache for recently read and recently written chunks to avoid repeated Parquet I/O.
-
-**Design**:
-
-```
-ChunkCache {
-    cache: LruCache<ChunkCoordinate, Arc<RecordBatch>>,
-    max_memory_bytes: usize,
-    dirty_set: HashSet<ChunkCoordinate>,  // chunks with pending patches
-}
-```
-
-- **Read path**: Before reading a Parquet file, check the cache. On hit, return the cached batch (with patches applied). On miss, read from disk and populate cache.
-- **Write path**: After applying patches in-flight, cache the merged result. Mark as dirty if patches are unapplied.
-- **Compaction**: After compaction, update the cache entry with the clean materialized version and clear the dirty flag.
-- **Eviction**: LRU by chunk coordinate, bounded by total memory. Dirty entries are flushed (compacted) before eviction.
-
-The cache would complement merge-on-read: frequently queried chunks with pending patches could be merged once and served from cache on subsequent reads.
-
-### Phase 3 — SQL:2023 MDA (Multi-Dimensional Array) integration
-
-SQL:2023 introduced the **MDA** (ISO 9075-15) standard for multi-dimensional arrays as first-class SQL types. ChunkDB's 4D chunk coordinate model maps naturally to MDA semantics.
-
-**Alignment with ChunkDB**:
-
-| MDA concept | ChunkDB equivalent |
-|---|---|
-| Array dimension | Chunk dimension (row_bucket, hash, range, col_group) |
-| Array cell | Individual chunk (Parquet file at a coordinate) |
-| Array slice (`A[x1:x2, y1:y2]`) | Pruned coordinate subspace |
-| Cell value type | RecordBatch (columnar data) |
-| `TRIM` / `EXTEND` | Compaction / chunk splitting |
-
-**Proposed integration**:
-
-```sql
--- MDA-style array declaration mapping to ChunkDB table
-CREATE ARRAY events
-  WITH DIMENSIONS (
-    time_bucket   REGULAR(3600),    -- range dimension, 1-hour chunks
-    sensor_hash   HASHED(50),       -- hash dimension, 50 buckets
-    col_group     GROUPS(3)         -- column groups
-  )
-  ATTRIBUTES (
-    timestamp  INT64,
-    sensor_id  UTF8,
-    value      FLOAT64
-  );
-
--- MDA slice maps to chunk-level pruning
-SELECT value
-FROM events[time_bucket(4610:4612), sensor_hash(7)]
-WHERE sensor_id = 'sensor_3';
-
--- Equivalent to current API:
--- db.select(&["value"]).from("events")
---   .filter(Filter::eq("sensor_id", "sensor_3"))
---   .filter(Filter::between("timestamp", 4610*3600, 4612*3600))
---   .execute().await?
-```
-
-**Why MDA may fit ChunkDB**: Traditional SQL treats tables as flat row sets. MDA recognizes that scientific/analytical data is often multi-dimensional. ChunkDB's internal model (chunk coordinates as array indices) shares structural similarities with MDA's array abstraction. An open question is whether MDA syntax can serve as a natural query language for the operations ChunkDB already supports — predicate-driven subspace selection, dimensional slicing, and array aggregation — with ISO-standard semantics.
-
-**Implementation path**:
-1. SQL parser layer (sqlparser-rs) mapping MDA syntax to ChunkDB's query builder
-2. Array metadata in the catalog (dimension types, bounds, chunk sizes)
-3. MDA-specific operations: `CONDENSE` (aggregation over dimensions), `COVERAGE` (spatial extent), array concatenation
-
-### Phase 4 — Operational improvements
-
-| Feature | Description |
-|---|---|
-| **Streaming reads** | Replace `Vec<RecordBatch>` with async `RecordBatchStream` to yield results lazily, reducing peak memory for large result sets |
-| **Background compaction** | Async task that compacts chunks with accumulated patches, reclaims space from old versions |
-| **Small chunk aggregation** | Merge undersized Parquet files into larger ones during compaction to mitigate the small files problem |
-| **Stale file cleanup** | GC for old Parquet versions after compaction |
-| **Configurable concurrency** | Expose semaphore limit and thread pool size as runtime parameters |
-| **Bloom filters** | Per-chunk Bloom filters for high-cardinality hash dimensions |
-| **Predicate pushdown** | Use Arrow's `ParquetRecordBatchStream::with_filter` for native Parquet predicate evaluation |
-| **Z-order clustering** | Improve locality for multi-dimensional range queries |
-| **Distributed catalog** | Replace sled with distributed KV (etcd, FoundationDB) for multi-node deployment |
-
----
-
+Operational backlog (not phase-bound): fsync policy for chunk files,
+scheduled GC, streaming reads (`RecordBatchStream`), configurable concurrency,
+group-commit for the WAL, broader filter/type coverage. A SQL:2023 MDA
+(multi-dimensional array) syntax layer over the coordinate model remains an
+exploratory idea.

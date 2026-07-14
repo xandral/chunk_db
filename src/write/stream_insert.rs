@@ -13,11 +13,14 @@ impl Default for StreamConfig {
     }
 }
 
-/// Streaming inserter that buffers small batches and flushes them to disk
-/// via BatchInserter (merge-on-write). Data is immediately materialized to parquet.
+/// Streaming inserter over the table's hot buffer: every `write` is fsynced
+/// to the WAL and immediately visible to queries; `flush` (automatic at the
+/// row threshold) materializes the buffer to Parquet via BatchInserter
+/// (merge-on-write).
 pub struct StreamInserter {
     _schema: SchemaRef,
-    buffer: Vec<RecordBatch>,
+    /// Rows written through this handle since its last flush (the hot buffer
+    /// itself is shared per table).
     buffered_rows: usize,
     config: StreamConfig,
     inserter: BatchInserter,
@@ -33,7 +36,6 @@ impl StreamInserter {
     ) -> Self {
         Self {
             _schema: schema,
-            buffer: Vec::new(),
             buffered_rows: 0,
             config,
             inserter,
@@ -42,8 +44,10 @@ impl StreamInserter {
         }
     }
 
+    /// Buffer a batch: durable and queryable on return. Materializes to
+    /// Parquet once the row threshold is crossed.
     pub fn write(&mut self, batch: &RecordBatch) -> crate::Result<Option<u64>> {
-        self.buffer.push(batch.clone());
+        self.inserter.buffer_insert(batch)?;
         self.buffered_rows += batch.num_rows();
         if self.buffered_rows >= self.config.buffer_capacity {
             return self.flush();
@@ -51,21 +55,15 @@ impl StreamInserter {
         Ok(None)
     }
 
-    /// Flush buffered data to disk via BatchInserter.
+    /// Materialize the table's hot buffer to Parquet.
     pub fn flush(&mut self) -> crate::Result<Option<u64>> {
-        if self.buffer.is_empty() {
-            return Ok(None);
+        let version = self.inserter.flush_hot()?;
+        if version.is_some() {
+            self.total_flushed += self.buffered_rows as u64;
+            self.flush_count += 1;
         }
-
-        let schema = self.buffer[0].schema();
-        let merged = arrow::compute::concat_batches(&schema, &self.buffer)?;
-        let version = self.inserter.insert(&merged)?;
-
-        self.total_flushed += self.buffered_rows as u64;
-        self.flush_count += 1;
-        self.buffer.clear();
         self.buffered_rows = 0;
-        Ok(Some(version))
+        Ok(version)
     }
 
     pub fn close(mut self) -> crate::Result<Option<u64>> {

@@ -42,12 +42,13 @@ With the fixed grid, chunk dimensions intersect: a chunk holds only rows matchin
 
 ### Catalog
 
-sled KV store at `<table>/catalog/` (src/catalog/version_catalog.rs) maps `bincode(coordinate) → latest version`, plus special keys: transaction counter, snowflake row-ID allocator, persisted table configs, and global min/max range stats (src/catalog/range_stats.rs). Queries do an O(n) scan of all coordinates (`all_chunks()`), then prune.
+sled KV store at `<base_path>/catalog/` (src/catalog/version_catalog.rs) maps `bincode(coordinate) → latest version`, plus special keys: transaction counter, snowflake row-ID allocator, persisted table configs, per-table level-map snapshots, and global min/max range stats (src/catalog/range_stats.rs). Queries do an O(n) scan of all coordinates (`all_chunks()`, served by an in-memory index), then prune.
 
 ### Write path (src/write/)
 
-- `BatchInserter` (batch_insert.rs): computes `__row_id`, groups rows by coordinate, **merge-on-write** (reads existing Parquet, concats, rewrites a new version), bumps catalog version.
-- `StreamInserter` (stream_insert.rs): buffers rows in memory, flushes through `BatchInserter` at a row threshold.
+- `BatchInserter` (batch_insert.rs): computes `__row_id`, groups rows by coordinate, **merge-on-write** (reads existing Parquet, concats, dedups by `__row_id`, rewrites a new version), bumps catalog version.
+- **Hot buffer** (release 0.4, docs/release-0.4-hot-buffer-gc.md): buffered inserts are `PatchOp::Insert` entries under key `hot:{table}` in the WAL-backed PatchLog — fsynced before ack, immediately queryable (union in the read path), replayed on `open`. Row ids are assigned at buffer time; `flush_hot` materializes through `BatchInserter::insert`, so a crash-replayed re-flush is deduplicated by `__row_id` (idempotent). `update_rows`/`delete_rows`/`compact` flush the hot buffer first (cell patches only reach materialized rows).
+- `StreamInserter` (stream_insert.rs): writes through the hot buffer (durable + queryable per `write()`), materializes at a row threshold.
 - **Updates/deletes** go through `PatchLog` (patch_log.rs): journal of Insert/Update/Delete patches keyed by chunk key + tx id, applied **merge-on-read** (patch_apply.rs) at query time. Since release 0.3 the PatchLog is **WAL-backed** (patch_wal.rs, `<base_path>/wal/patches.wal`): every mutation is fsynced before it is visible, replayed on `open`, checkpointed at open, and truncated when compaction/splits materialize everything. `PatchLog::new()` is the volatile variant (tests). Update/Insert patch batches carry the full table schema; compaction and splits project them per column group (`project_patches_to_schema`) before applying.
 - `Compactor` (compaction.rs): reads base Parquet + pending patches, writes a clean new version, clears patches. `AutoCompaction` (auto_compaction.rs) runs it on a background thread. A shared per-cell `CompactionLock` (src/concurrency/, key = patch key) mutually excludes compaction and cell splits; both skip cells they cannot lock.
 - `ChunkCache` (src/storage/chunk_cache.rs): in-memory cache of merged batches keyed by chunk key + the tx id patches were applied up to; invalidated/refreshed on writes and compaction.
@@ -59,21 +60,21 @@ Three pruning layers, coarse to fine:
 2. **Row-group**: Parquet per-column min/max statistics skip row groups.
 3. **Row-level** (direct_executor.rs): Arrow compute kernels apply filters to surviving rows.
 
-Surviving chunks are grouped by RowKey (row_bucket + hash + range); when a query spans multiple column groups, batches are inner-joined on `__row_id` (`vertical_join` in chunk_merger.rs). Filter-only columns are added to the projection during scan, then stripped. Parallelism: tokio for orchestration (semaphore-bounded, hardcoded 128), rayon inside tasks — deliberately no nested `par_iter`.
+Surviving chunks are grouped by RowKey (row_bucket + hash + range); when a query spans multiple column groups, batches are inner-joined on `__row_id` (`vertical_join` in chunk_merger.rs). Filter-only columns are added to the projection during scan, then stripped. After the scan, the table's **hot buffer is unioned in** (row-filtered, deduplicated by `__row_id` against a racing flush — chunk side wins). Parallelism: tokio for orchestration (semaphore-bounded, hardcoded 128), rayon inside tasks — deliberately no nested `par_iter`.
 
 `QueryBuilder` (query_builder.rs) is the fluent public API: `db.select(...).from(...).filter(Filter::eq(...)).execute()/count()/sum()/...`.
 
 ### Entry point
 
-`ChunkDb` (src/api/database.rs) ties everything together: `open`, `create_table` (via `TableBuilder`), `insert`, `delete_rows`, `update_rows`, `compact`, `stream_inserter`, `start_auto_compaction`, `select`/`select_all`. Table configs persist in the catalog and reload on `open`.
+`ChunkDb` (src/api/database.rs) ties everything together: `open`, `create_table` (via `TableBuilder`), `insert`, `insert_buffered`/`flush_hot_buffer`, `delete_rows`, `update_rows`, `compact`, `collect_garbage` (orphan chunk files; `min_age` guards in-flight inserts), `stream_inserter`, `start_auto_compaction`, `select`/`select_all`. Table configs persist in the catalog and reload on `open` (which also replays the WAL).
 
 ## Design direction (important)
 
-**docs/architecture-evolution.md is the agreed target architecture (2026-06)** — read it before proposing structural changes. Summary: the fixed grid cannot survive data skew (small-files problem is structural, not a tuning issue). The plan replaces it with a **hierarchical adaptive grid**: coarse base grid, cells split in half on row-count overflow (coordinate gains a `level` field; extendible hashing for hash dims), in-file sorting + bloom filters for rare-value selectivity, a WAL-backed queryable hot buffer for durability and fresh reads, and **split-instead-of-compaction** (splits apply pending patches and rewrite clean). The README's "Configuration tuning" section is slated for obsolescence under this plan. New work should align with the phased plan in that doc. Status: Phase 2 (adaptive row grid, docs/release-0.2-adaptive-row-grid.md) and the durability half of Phase 1 (WAL-backed PatchLog, docs/release-0.3-patch-wal.md) are implemented; next is the rest of Phase 1 (queryable hot buffer + insert-side WAL). docs/review-0.2-code-review.md records the 0.2 review, its fixes, and the remaining gap analysis.
+**docs/architecture-evolution.md is the agreed target architecture (2026-06)** — read it before proposing structural changes. Summary: the fixed grid cannot survive data skew (small-files problem is structural, not a tuning issue). The plan replaces it with a **hierarchical adaptive grid**: coarse base grid, cells split in half on row-count overflow (coordinate gains a `level` field; extendible hashing for hash dims), in-file sorting + bloom filters for rare-value selectivity, a WAL-backed queryable hot buffer for durability and fresh reads, and **split-instead-of-compaction** (splits apply pending patches and rewrite clean). The README's "Configuration tuning" section is slated for obsolescence under this plan. New work should align with the phased plan in that doc. Status: **Phases 1 and 2 are complete** — adaptive row grid (0.2, docs/release-0.2-adaptive-row-grid.md), WAL-backed PatchLog (0.3, docs/release-0.3-patch-wal.md), queryable hot buffer + insert WAL + orphan GC (0.4, docs/release-0.4-hot-buffer-gc.md). Next: skew benchmark, then Phase 3 (hash/range splits, in-file sort + bloom, undersized-cell merge). docs/review-0.2-code-review.md records the 0.2 review, its fixes, and the remaining gap analysis.
 
 ## Documentation drift warnings
 
-- README.md "Limitations" still says append-only/no updates — stale since the patch-log commit added `update_rows`/`delete_rows`/`compact`. The README's "Project structure" also predates `src/concurrency/`, `src/write/patch_*`, `compaction.rs`, `stream_insert.rs`, and `src/storage/chunk_cache.rs`.
+- README.md was realigned 2026-07-12 (mutations, hot buffer, adaptive grid, project structure, roadmap). Its benchmark numbers still predate the adaptive grid/hot buffer.
 - docs/agents.md describes a `.claude/agents/` agent ecosystem that is **not currently present** in the repo — treat it as a design/aspiration doc, not as available tooling.
 
 ## Conventions

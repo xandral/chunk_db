@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::api::database::patch_key;
+use crate::api::database::{hot_buffer_key, patch_key};
 use crate::catalog::{HashRegistry, VersionCatalog};
 use crate::concurrency::CompactionLock;
 use crate::config::table_config::TableConfig;
@@ -232,6 +232,78 @@ impl BatchInserter {
         }
 
         Ok(version)
+    }
+
+    /// Buffered insert (hot buffer): assign row ids, then record the batch as
+    /// an Insert entry in the WAL-backed PatchLog under the table's hot key.
+    /// Durable (fsynced) and visible to queries on return; materialized to
+    /// Parquet later by `flush_hot`.
+    pub fn buffer_insert(&self, batch: &RecordBatch) -> Result<u64> {
+        let prepared = self.with_row_id_column(batch)?;
+        let tx_id = self.catalog.next_transaction_id()?;
+        self.patch_log.record(
+            &hot_buffer_key(&self.config.name),
+            tx_id,
+            PatchOp::Insert(prepared),
+        )?;
+        Ok(tx_id)
+    }
+
+    /// Materialize the hot buffer (entries up to the current transaction)
+    /// into chunk files through the normal insert path. Crash-safe: rows keep
+    /// the __row_id assigned at buffer time, so if we crash between the
+    /// insert and the clear, the replayed re-insert is deduplicated by
+    /// merge-on-write. Returns the version written (None = buffer empty).
+    pub fn flush_hot(&self) -> Result<Option<u64>> {
+        let key = hot_buffer_key(&self.config.name);
+        let snapshot_tx = self.catalog.current_transaction_id();
+        let entries = self.patch_log.get_patches_up_to(&key, snapshot_tx);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let mut batches = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            match &entry.op {
+                PatchOp::Insert(batch) => batches.push(batch.clone()),
+                other => {
+                    return Err(crate::ChunkDbError::Config(format!(
+                        "hot buffer for table '{}' contains a non-insert entry ({:?}) — \
+                         updates/deletes must go through the cell patch keys",
+                        self.config.name, other,
+                    )));
+                }
+            }
+        }
+
+        let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
+        let version = self.insert(&merged)?;
+        self.patch_log.clear_patches_up_to(&key, snapshot_tx)?;
+        Ok(Some(version))
+    }
+
+    /// Return `batch` with a `__row_id` column prepended and the remaining
+    /// columns ordered per the table schema — the shape hot-buffer batches
+    /// carry (all buffered batches must concat at flush time).
+    fn with_row_id_column(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let row_ids = self.get_or_generate_row_ids(batch, batch.num_rows())?;
+        let table_schema = self.config.arrow_schema();
+        let batch_schema = batch.schema();
+
+        let mut fields: Vec<Field> = vec![Field::new("__row_id", DataType::UInt64, false)];
+        let mut arrays: Vec<ArrayRef> =
+            vec![Arc::new(UInt64Array::from(row_ids)) as ArrayRef];
+
+        for field in table_schema.fields() {
+            if field.name() == "__row_id" {
+                continue;
+            }
+            let idx = batch_schema.index_of(field.name())?;
+            fields.push(Field::clone(batch_schema.field(idx)));
+            arrays.push(batch.column(idx).clone());
+        }
+
+        Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
     }
 
     /// Split row cell (level, bucket) in half along the row dimension.

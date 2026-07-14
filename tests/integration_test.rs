@@ -1043,3 +1043,185 @@ async fn test_patch_wal_durability_across_reopen() {
 
     println!("✓ Patch WAL: updates/deletes survive reopen, WAL truncated after compaction");
 }
+
+/// Hot buffer: buffered inserts are immediately queryable, survive a reopen
+/// without any flush (insert-side WAL), and are materialized by flush.
+#[tokio::test]
+async fn test_hot_buffer_visible_durable_and_flushable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+
+    {
+        let mut db = ChunkDb::open(db_path).unwrap();
+        let config = TableBuilder::new("h", db_path)
+            .add_column("id", "Int64", false)
+            .add_column("value", "Int64", true)
+            .chunk_rows(1000)
+            .with_primary_key_as_row_id("id")
+            .build();
+        db.create_table(config).unwrap();
+
+        // 10 materialized rows + 5 buffered rows, no flush.
+        let base = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(0..10)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((0..10).map(|i| i * 10))) as _),
+        ]).unwrap();
+        db.insert("h", &base).unwrap();
+
+        let hot = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(100..105)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((100..105).map(|i| i * 10))) as _),
+        ]).unwrap();
+        db.insert_buffered("h", &hot).unwrap();
+
+        // Immediately queryable: full scan, filter, aggregation.
+        let count = db.select_all("h").count().await.unwrap();
+        assert_eq!(count, 15, "buffered rows must be visible without a flush");
+        let v = db.select_all("h").filter(Filter::eq("id", 102)).sum("value").await.unwrap();
+        assert_eq!(v, 1020, "filters must apply to buffered rows");
+        let all = db.select_all("h").filter(Filter::gte("id", 0)).sum("value").await.unwrap();
+        assert_eq!(all, (0..10).map(|i| i * 10).sum::<i64>() + (100..105).map(|i| i * 10).sum::<i64>());
+        // Deliberately no flush: drop with the rows only in the WAL.
+    }
+
+    {
+        let db = ChunkDb::open(db_path).unwrap();
+        let count = db.select_all("h").count().await.unwrap();
+        assert_eq!(count, 15, "buffered inserts must survive the reopen via WAL replay");
+
+        // Flush materializes; the WAL empties (no other patches around).
+        let version = db.flush_hot_buffer("h").unwrap();
+        assert!(version.is_some(), "flush must materialize the replayed buffer");
+        let count = db.select_all("h").count().await.unwrap();
+        assert_eq!(count, 15, "no duplicates after flush");
+        let wal_len = std::fs::metadata(
+            std::path::Path::new(db_path).join("wal").join("patches.wal")
+        ).unwrap().len();
+        assert_eq!(wal_len, 0, "WAL must be truncated once the buffer is materialized");
+    }
+
+    {
+        let db = ChunkDb::open(db_path).unwrap();
+        let count = db.select_all("h").count().await.unwrap();
+        assert_eq!(count, 15);
+        let v = db.select_all("h").filter(Filter::eq("id", 102)).sum("value").await.unwrap();
+        assert_eq!(v, 1020);
+    }
+
+    println!("✓ Hot buffer: queryable pre-flush, durable across reopen, clean flush");
+}
+
+/// StreamInserter over the hot buffer: rows visible before any flush, and
+/// updates/deletes reach buffered rows (implicit flush).
+#[tokio::test]
+async fn test_stream_inserter_immediately_queryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let rid = |v: i64| chunk_db::partitioning::i64_to_ordered_u64(v);
+
+    let mut db = ChunkDb::open(db_path).unwrap();
+    let config = TableBuilder::new("s", db_path)
+        .add_column("id", "Int64", false)
+        .add_column("value", "Int64", true)
+        .chunk_rows(1000)
+        .with_primary_key_as_row_id("id")
+        .build();
+    db.create_table(config).unwrap();
+
+    // Large capacity: no auto-flush happens during the writes.
+    let mut stream = db.stream_inserter("s", StreamConfig { buffer_capacity: 1_000_000 }).unwrap();
+    for i in 0..3 {
+        let offset = i * 10;
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(offset..offset + 10)) as _),
+            ("value", Arc::new(Int64Array::from_iter_values((offset..offset + 10).map(|x| x * 2))) as _),
+        ]).unwrap();
+        stream.write(&batch).unwrap();
+    }
+    assert_eq!(stream.flush_count(), 0, "below the threshold: nothing materialized yet");
+    assert_eq!(stream.buffered_rows(), 30);
+
+    let count = db.select_all("s").count().await.unwrap();
+    assert_eq!(count, 30, "streamed rows must be queryable before any flush");
+
+    // Updating a still-buffered row works (update flushes the buffer first).
+    let upd = RecordBatch::try_from_iter(vec![
+        ("__row_id", Arc::new(UInt64Array::from(vec![rid(7)])) as _),
+        ("id", Arc::new(Int64Array::from(vec![7i64])) as _),
+        ("value", Arc::new(Int64Array::from(vec![999i64])) as _),
+    ]).unwrap();
+    db.update_rows("s", &upd).unwrap();
+    db.delete_rows("s", &[rid(20)]).unwrap();
+
+    let count = db.select_all("s").count().await.unwrap();
+    assert_eq!(count, 29, "delete must reach previously buffered rows");
+    let v7 = db.select_all("s").filter(Filter::eq("id", 7)).sum("value").await.unwrap();
+    assert_eq!(v7, 999, "update must reach previously buffered rows");
+
+    // close() after the implicit flush is a no-op but must not fail.
+    stream.close().unwrap();
+    let count = db.select_all("s").count().await.unwrap();
+    assert_eq!(count, 29);
+
+    println!("✓ StreamInserter: durable + queryable writes, patches reach buffered rows");
+}
+
+/// Garbage collection: superseded chunk versions become orphans after
+/// compaction and are removed without touching live data.
+#[tokio::test]
+async fn test_gc_removes_superseded_chunk_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let rid = |v: i64| chunk_db::partitioning::i64_to_ordered_u64(v);
+
+    let mut db = ChunkDb::open(db_path).unwrap();
+    let config = TableBuilder::new("g", db_path)
+        .add_column("id", "Int64", false)
+        .add_column("value", "Int64", true)
+        .chunk_rows(1000)
+        .with_primary_key_as_row_id("id")
+        .build();
+    db.create_table(config).unwrap();
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int64Array::from_iter_values(0..50)) as _),
+        ("value", Arc::new(Int64Array::from_iter_values((0..50).map(|i| i * 10))) as _),
+    ]).unwrap();
+    db.insert("g", &batch).unwrap();
+
+    // Update + compact writes a new chunk version; the old one is an orphan.
+    let upd = RecordBatch::try_from_iter(vec![
+        ("__row_id", Arc::new(UInt64Array::from(vec![rid(1)])) as _),
+        ("id", Arc::new(Int64Array::from(vec![1i64])) as _),
+        ("value", Arc::new(Int64Array::from(vec![555i64])) as _),
+    ]).unwrap();
+    db.update_rows("g", &upd).unwrap();
+    db.compact("g").unwrap();
+
+    let chunks_dir = std::path::Path::new(db_path).join("g").join("chunks");
+    let files_before = std::fs::read_dir(&chunks_dir).unwrap().count();
+    let live = db.live_chunk_files("g").unwrap().len();
+    assert!(files_before > live, "compaction must have left a superseded version behind");
+
+    // min_age high: nothing is young enough... err, old enough — all kept.
+    let cautious = db.collect_garbage("g", std::time::Duration::from_secs(3600)).unwrap();
+    assert_eq!(cautious.files_removed, 0);
+    assert!(cautious.files_kept_young > 0);
+
+    let result = db.collect_garbage("g", std::time::Duration::ZERO).unwrap();
+    assert!(result.files_removed > 0, "orphans must be deleted");
+    assert!(result.bytes_reclaimed > 0);
+    let files_after = std::fs::read_dir(&chunks_dir).unwrap().count();
+    assert_eq!(files_after, live, "only catalog-referenced files remain");
+
+    // Data intact, also across a reopen.
+    let count = db.select_all("g").count().await.unwrap();
+    assert_eq!(count, 50);
+    let v1 = db.select_all("g").filter(Filter::eq("id", 1)).sum("value").await.unwrap();
+    assert_eq!(v1, 555);
+    drop(db);
+    let db = ChunkDb::open(db_path).unwrap();
+    assert_eq!(db.select_all("g").count().await.unwrap(), 50);
+
+    println!("✓ GC: superseded versions removed, live data untouched");
+}

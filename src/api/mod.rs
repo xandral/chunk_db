@@ -1,5 +1,5 @@
 pub mod database;
 
-pub use database::{ChunkDb, TableBuilder};
+pub use database::{ChunkDb, GcResult, TableBuilder};
 
 

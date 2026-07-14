@@ -14,8 +14,8 @@ use crate::storage::{ChunkInfo, ChunkCache, chunk_path};
 use crate::query::filter::{Filter, FilterOp, FilterValue};
 use crate::query::chunk_merger::{group_chunks_by_row_key, vertical_join, RowKey};
 use crate::query::pruning::prune_chunks;
-use crate::write::{PatchLog, apply_patches};
-use crate::api::database::patch_key;
+use crate::write::{PatchLog, PatchOp, apply_patches};
+use crate::api::database::{hot_buffer_key, patch_key};
 use crate::Result;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -200,6 +200,11 @@ impl DirectExecutor {
             None
         };
 
+        // Hot buffer: buffered inserts (full table schema, __row_id included)
+        // are unioned with the chunk scan below. Snapshot isolation comes for
+        // free from the patch-log tx filter.
+        let hot_batches = self.hot_batches_up_to_snapshot();
+
         // 2. Prune chunks
         let pruned_chunks = prune_chunks(
             &self.config,
@@ -211,7 +216,7 @@ impl DirectExecutor {
             &self.schema,
         )?;
 
-        if pruned_chunks.is_empty() {
+        if pruned_chunks.is_empty() && hot_batches.is_empty() {
             // Return empty result with proper schema
             let output_schema = if let Some(proj) = final_projection {
                 let fields: Vec<_> = proj
@@ -274,6 +279,33 @@ impl DirectExecutor {
 
         let mut batches: Vec<RecordBatch> = results.into_iter().flatten().collect();
 
+        // Union the hot buffer with the chunk scan. A flush that raced this
+        // query may have already materialized some buffered rows into the
+        // chunks read above — deduplicate by __row_id, chunk side wins.
+        if !hot_batches.is_empty() {
+            let chunk_row_ids = collect_row_ids(&batches);
+            for hot in hot_batches {
+                let mut b = if filters.is_empty() {
+                    hot
+                } else {
+                    apply_row_filters(hot, filters)?
+                };
+                if !chunk_row_ids.is_empty() {
+                    b = remove_rows_with_ids(b, &chunk_row_ids)?;
+                }
+                if let Some(cols) = shared_ext_projection.as_ref() {
+                    // Match the chunk-side shape: extended columns plus
+                    // __row_id (needed by composite OR deduplication).
+                    let mut proj = vec!["__row_id".to_string()];
+                    proj.extend(cols.iter().filter(|c| c.as_str() != "__row_id").cloned());
+                    b = apply_final_projection(b, &proj)?;
+                }
+                if b.num_rows() > 0 {
+                    batches.push(b);
+                }
+            }
+        }
+
         if let Some(final_proj) = final_projection {
             if shared_ext_projection.is_some() {
                 batches = batches
@@ -284,6 +316,18 @@ impl DirectExecutor {
         }
 
         Ok(batches)
+    }
+
+    /// Buffered inserts for this table visible at the query snapshot.
+    fn hot_batches_up_to_snapshot(&self) -> Vec<RecordBatch> {
+        self.patch_log
+            .get_patches_up_to(&hot_buffer_key(&self.config.name), self.snapshot_tx_id)
+            .into_iter()
+            .filter_map(|entry| match entry.op {
+                PatchOp::Insert(batch) => Some(batch),
+                _ => None,
+            })
+            .collect()
     }
 
     fn scan_row_key(
@@ -516,6 +560,45 @@ impl DirectExecutor {
 
         Ok(max_val)
     }
+}
+
+/// Collect the __row_id values present in a set of batches (used to
+/// deduplicate the hot buffer against chunks a racing flush already wrote).
+fn collect_row_ids(batches: &[RecordBatch]) -> std::collections::HashSet<u64> {
+    use arrow::array::UInt64Array;
+
+    let mut ids = std::collections::HashSet::new();
+    for batch in batches {
+        let Ok(idx) = batch.schema().index_of("__row_id") else { continue };
+        if let Some(arr) = batch.column(idx).as_any().downcast_ref::<UInt64Array>() {
+            ids.extend(arr.values().iter().copied());
+        }
+    }
+    ids
+}
+
+/// Drop the rows of `batch` whose __row_id is in `ids`.
+fn remove_rows_with_ids(
+    batch: RecordBatch,
+    ids: &std::collections::HashSet<u64>,
+) -> Result<RecordBatch> {
+    use arrow::array::{BooleanArray, UInt64Array};
+
+    let idx = batch.schema().index_of("__row_id")?;
+    let row_ids = batch.column(idx).as_any().downcast_ref::<UInt64Array>()
+        .ok_or_else(|| crate::ChunkDbError::Config("__row_id must be UInt64".into()))?;
+
+    if row_ids.values().iter().all(|id| !ids.contains(id)) {
+        return Ok(batch);
+    }
+
+    let mask = BooleanArray::from(
+        row_ids.values().iter().map(|id| !ids.contains(id)).collect::<Vec<bool>>()
+    );
+    let columns: Result<Vec<_>> = batch.columns().iter()
+        .map(|col| Ok(arrow::compute::filter(col, &mask)?))
+        .collect();
+    Ok(RecordBatch::try_new(batch.schema(), columns?)?)
 }
 
 /// Apply final projection to remove filter-only columns

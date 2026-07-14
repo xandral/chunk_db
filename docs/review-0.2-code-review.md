@@ -270,15 +270,15 @@ release-0.2 doc §1/§7/§11.
 | Missing piece | Current cost of its absence |
 |---|---|
 | ~~**Persistent PatchLog / WAL for updates & deletes**~~ | ✅ **Shipped 2026-07-08** ([release-0.3-patch-wal.md](release-0.3-patch-wal.md)): the PatchLog is WAL-backed (`patch_wal.rs`, fsync-before-visible, replay on open, checkpoint + auto-truncate). Un-compacted updates/deletes survive a crash. Covered by `test_patch_wal_durability_across_reopen` + 3 unit tests (replay, clear replay, corrupt-tail). |
-| **WAL for inserts + hot buffer** | Inserts are durable only after the full merge-on-write path (Parquet rewrite + sled flush) completes; there is no cheap append-then-ack. Also no "insert → instantly queryable" story: `StreamInserter`'s buffered rows are invisible to queries until flush **and are still lost on crash** (the patch WAL does not cover them). |
-| **Query-time union with hot buffer, dedup by `__row_id`** | Blocked on the hot buffer existing; this is the HTAP-lite headline of the architecture doc §5. |
-| **fsync policy for chunk files** | Unchanged v0 behavior — Parquet writes ride the OS page cache; a crash can lose acked-flushed data. Should be decided (and documented) together with the hot-buffer flush. |
+| ~~**WAL for inserts + hot buffer**~~ | ✅ **Shipped 2026-07-12** ([release-0.4-hot-buffer-gc.md](release-0.4-hot-buffer-gc.md)): buffered inserts live as `Insert` entries under `hot:{table}` in the WAL-backed PatchLog — cheap append-then-ack, replayed on open; `StreamInserter` writes through it (durable + queryable at once). |
+| ~~**Query-time union with hot buffer, dedup by `__row_id`**~~ | ✅ **Shipped 2026-07-12**: `execute_internal` unions the hot buffer with the chunk scan, deduplicating by `__row_id` against a racing flush. |
+| **fsync policy for chunk files** | Unchanged v0 behavior — Parquet writes ride the OS page cache; a power failure can lose acked plain `insert()`s (the buffered path is fsynced). Decide and document together with a group-commit policy. |
 
 ### Maintenance loop (was "AutoCompaction", architecture doc §6)
 
 | Missing piece | Current cost |
 |---|---|
-| **Orphan-file GC** | Splits leave parent `.parquet` files on disk forever (only the catalog forgets them); superseded merge-on-write versions likewise. `live_chunk_files()` (added in this diff) provides the liveness oracle — the GC sweep itself doesn't exist. Disk usage grows monotonically. |
+| ~~**Orphan-file GC**~~ | ✅ **Shipped 2026-07-12** (`ChunkDb::collect_garbage`, [release-0.4-hot-buffer-gc.md](release-0.4-hot-buffer-gc.md) §3): removes superseded versions and pre-split parents, `min_age` guard for in-flight inserts. Still manual — no scheduler, no reader coordination. |
 | **Merge of undersized sibling cells** | Cells only ever split; data deletion can strand many tiny cells. Phase 3 per plan. |
 | **Compaction → maintenance-loop absorption** | Split-instead-of-compaction is half-done: splits compact, but the standalone `Compactor`/`AutoCompaction` still exists with its own patch-application path — which is exactly where F1/F2 live. Worth deciding whether Phase 1 retires it. |
 
@@ -304,14 +304,18 @@ release-0.2 doc §1/§7/§11.
 2. ~~**P1 hardening** (F4–F7) + P2 cleanup~~ ✅ done 2026-07-07.
 3. ~~**Patch WAL** (durability half of Phase 1)~~ ✅ done 2026-07-08
    ([release-0.3-patch-wal.md](release-0.3-patch-wal.md)).
-4. **Commit the working tree** (0.2 + fixes + 0.3 are all uncommitted).
-5. **Skew benchmark** (README headline number for the adaptive grid) — also
-   the moment to fix the README drift (limitations/project structure).
-6. **Rest of Phase 1: queryable hot buffer + insert-side WAL** — fresh reads
-   (HTAP-lite) + insert durability/StreamInserter coverage; decide the fate
-   of the standalone Compactor and the chunk-file fsync policy here.
-7. **Orphan-file GC** (can ride along with Phase 1's maintenance loop;
-   `live_chunk_files()` is the oracle).
-8. **Phase 3** per the architecture doc (hash/range splits, in-file sort +
+4. ~~**Commit the working tree**~~ ✅ done 2026-07-11 (`c0140e8`).
+5. ~~**Rest of Phase 1: queryable hot buffer + insert-side WAL**~~ ✅ done
+   2026-07-12 ([release-0.4-hot-buffer-gc.md](release-0.4-hot-buffer-gc.md)).
+   Still open from this item: chunk-file fsync policy and the fate of the
+   standalone Compactor.
+6. ~~**Orphan-file GC**~~ ✅ done 2026-07-12 (`ChunkDb::collect_garbage`,
+   manual trigger only).
+7. ~~README drift fix~~ ✅ done 2026-07-12 (limitations, project structure,
+   roadmap, mutations/hot-buffer docs).
+8. **Skew benchmark** (README headline number for the adaptive grid:
+   small-files count before/after `max_cell_rows`).
+9. **Phase 3** per the architecture doc (hash/range splits, in-file sort +
    bloom, undersized-cell merge). Backlog: migrate the pre-existing
-   integration tests to `tempfile::tempdir()`.
+   integration tests to `tempfile::tempdir()`; scheduled GC; fsync/group-commit
+   policy.

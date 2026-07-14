@@ -77,6 +77,11 @@ inert (no chunks exist at the parent cell; the compactor clears them).
 
 ## 5. Not in this release (rest of Phase 1)
 
+> **Status update (2026-07-12):** everything in the first two bullets shipped
+> as release 0.4 ([release-0.4-hot-buffer-gc.md](release-0.4-hot-buffer-gc.md))
+> — queryable hot buffer + insert-side WAL built on this PatchLog. The chunk
+> fsync policy and group-commit remain open.
+
 - **Queryable hot buffer**: inserts buffered in memory, visible to queries
   via merge-on-read union, flushed through the normal write path. This is the
   HTAP-lite headline of the architecture doc §4/§5.

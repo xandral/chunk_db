@@ -25,7 +25,7 @@ pub use query::{Filter, FilterOp, FilterValue, CompositeFilter, QueryBuilder, Di
 pub mod concurrency;
 
 pub mod api;
-pub use api::{ChunkDb, TableBuilder};
+pub use api::{ChunkDb, GcResult, TableBuilder};
 
 // Re-export commonly used Arrow types
 pub use arrow::array::RecordBatch;
