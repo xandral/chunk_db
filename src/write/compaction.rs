@@ -4,10 +4,11 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::catalog::VersionCatalog;
 use crate::concurrency::CompactionLock;
-use crate::storage::{chunk_path, write_parquet, ChunkCache};
+use crate::config::TableConfig;
+use crate::storage::{chunk_path, write_table_parquet, ChunkCache};
 use crate::write::patch_log::PatchLog;
 use crate::write::patch_apply::{apply_patches, project_patches_to_schema};
-use crate::{ChunkDbError, Result};
+use crate::Result;
 
 pub struct Compactor<'a> {
     catalog: &'a VersionCatalog,
@@ -15,6 +16,7 @@ pub struct Compactor<'a> {
     chunk_cache: &'a ChunkCache,
     base_path: &'a PathBuf,
     compaction_lock: &'a CompactionLock,
+    config: &'a TableConfig,
 }
 
 #[derive(Debug)]
@@ -23,6 +25,8 @@ pub struct CompactionResult {
     pub bytes_before: u64,
     pub bytes_after: u64,
     pub patches_applied: usize,
+    /// Local adaptive cells coalesced after patches were materialized.
+    pub cells_merged: usize,
 }
 
 impl CompactionResult {
@@ -32,6 +36,7 @@ impl CompactionResult {
             bytes_before: 0,
             bytes_after: 0,
             patches_applied: 0,
+            cells_merged: 0,
         }
     }
 }
@@ -43,8 +48,9 @@ impl<'a> Compactor<'a> {
         chunk_cache: &'a ChunkCache,
         base_path: &'a PathBuf,
         compaction_lock: &'a CompactionLock,
+        config: &'a TableConfig,
     ) -> Self {
-        Self { catalog, patch_log, chunk_cache, base_path, compaction_lock }
+        Self { catalog, patch_log, chunk_cache, base_path, compaction_lock, config }
     }
 
     /// Compact all dirty row_buckets for a table.
@@ -121,7 +127,7 @@ impl<'a> Compactor<'a> {
                 let compacted = apply_patches(batch, &projected)?;
 
                 let new_path = chunk_path(self.base_path, table_name, coord, new_version);
-                write_parquet(&new_path, &compacted, None)?;
+                write_table_parquet(&new_path, &compacted, self.config)?;
                 let bytes_after = std::fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
 
                 self.catalog.update_version(table_name, coord, new_version)?;
@@ -152,11 +158,12 @@ impl<'a> Compactor<'a> {
 fn read_parquet_file(path: &Path) -> Result<RecordBatch> {
     let file = std::fs::File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema().clone();
     let reader = builder.build()?;
     let batches: Vec<RecordBatch> = reader
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if batches.is_empty() {
-        return Err(ChunkDbError::Config("Empty parquet file during compaction".to_string()));
+        return Ok(RecordBatch::new_empty(schema));
     }
     Ok(arrow::compute::concat_batches(&batches[0].schema(), &batches)?)
 }

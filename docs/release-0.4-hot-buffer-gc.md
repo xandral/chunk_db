@@ -131,5 +131,7 @@ Safety rules:
   prototype rates, revisit if the insert WAL becomes the main write path.
 - **Scheduled GC / GC-vs-reader coordination**: `collect_garbage` is manual.
 - **Auto-flush by size/time** for `insert_buffered` outside `StreamInserter`.
-- Phase 3 of the architecture doc: multi-dimension splits, merge of
-  undersized cells, in-file sort + bloom filters, zone maps.
+- ~~Phase 3 of the architecture doc: multi-dimension splits, merge of
+  undersized cells, in-file sort + bloom filters.~~ Implemented by
+  [release 0.5](release-0.5-adaptive-multidimensional-grid.md). Custom zone
+  maps and query-time Bloom consumption remain open.

@@ -5,9 +5,9 @@
 > **AI-assisted development**: This project was built with significant assistance from Claude (Anthropic). Implementation, benchmarks, and documentation were developed collaboratively between a human developer and an AI assistant.
 
 A columnar storage engine built on Arrow and Parquet that physically partitions
-data across four dimensions simultaneously — row buckets, column groups, hash
-buckets, and range buckets — so that queries can potentially skip irrelevant
-chunks without scanning the full dataset.
+data across four dimensions — row buckets, column groups, hash buckets and
+range buckets — and refines overloaded row/hash/range cells locally. Queries
+can skip irrelevant rectangles from their coordinates before reading data.
 
 Inspired by the [Zarr](https://zarr.dev/) chunked array model, ChunkDB
 investigates applying the same idea to tabular data: split a logical table into
@@ -36,9 +36,13 @@ row_bucket 1│               │   │               │   │               �
 row_bucket 2│     ...       │   │     ...       │   │     ...       │
             └───────────────┘   └───────────────┘   └───────────────┘
 
-  Within each cell, data is further split by:
-    hash_bucket[0]  = xxh3(sensor_id) % 50     (one file per sensor bucket)
-    range_bucket[0] = timestamp / 3600          (one file per hour)
+  At base level, each cell is further split by:
+    hash_bucket[0]  = xxh3(sensor_id) % 50
+    range_bucket[0] = floor(timestamp / 3600)
+
+  An overloaded cell can refine one axis locally:
+    hash modulus  -> 50 * 2^local_level
+    range width   -> 3600 / 2^local_level
 ```
 
 A query like `SELECT value1 WHERE sensor_id = 'sensor_3' AND timestamp
@@ -48,7 +52,8 @@ everything else at the metadata level without I/O.
 
 ### The chunk coordinate
 
-Every Parquet file on disk is identified by a 4D coordinate:
+Every Parquet file on disk is identified by a coordinate plus the local depth
+of each adaptive axis:
 
 ```
 ChunkCoordinate {
@@ -57,6 +62,8 @@ ChunkCoordinate {
     col_group:     u16,        // which column subset
     hash_buckets:  Vec<u64>,   // one per hash dimension
     range_buckets: Vec<u64>,   // one per range dimension
+    hash_levels:   Vec<u16>,   // local depth per hash dimension
+    range_levels:  Vec<u16>,   // local depth per range dimension
 }
 ```
 
@@ -67,14 +74,17 @@ determined by the **intersection** of all dimensions. For example, with
 `chunk_rows = 100,000` and `hash_buckets = 50`, a chunk is addressed by
 (row_bucket, hash_bucket, ...) — but if a particular sensor only appears 200
 times in that row bucket, the resulting Parquet file will contain only 200 rows,
-not 100,000. This **small files problem** is inherent to multi-dimensional
-partitioning. On the row axis it is addressed by the **adaptive row grid**
-(release 0.2): with `.max_cell_rows(n)` set, a coarse base grid refines itself
-by splitting overflowing cells in half (geohash/quadtree style — the `level`
-field above), so granularity follows the data instead of being guessed at
-setup time. Hash and range dimensions do not split yet (see
-[Known issues](#known-issues-and-limitations) and
-[docs/architecture-evolution.md](docs/architecture-evolution.md)).
+not 100,000. With `.max_cell_rows(n)`, the **adaptive multidimensional grid**
+can split an overflowing logical cell along row, hash or range. It measures the
+next-level distributions, selects the best-balanced axis and prefers a local
+hash/range split when it is close to the best row split. The shape is persisted
+and routing descends it by formula after reopen.
+
+This solves overfull cells, but not every small-file case. A level-zero grid
+that is already too fine can create many underfilled cells without triggering
+any split; the current merge only reverses previous local splits and cannot
+coalesce arbitrary base buckets. See the measured verdict in
+[docs/decisive-tests-and-verdict.md](docs/decisive-tests-and-verdict.md).
 
 
 
@@ -97,14 +107,12 @@ ones (e.g., dates before 1970-01-01). With `chunk_rows = 100_000` and a
 timestamp-based row ID, rows with nearby timestamps land in the same bucket,
 providing temporal locality.
 
-With the adaptive row grid enabled (`.max_cell_rows(n)`), a cell whose chunk
-file exceeds `n` rows is split in half along the row axis
-(`row_bucket = floor(row_id · 2^level / chunk_rows)`, children `2b`/`2b+1` at
-`level+1`), recursively. Pending patches are applied during the split
-(compact-on-split), and the per-table set of refined cells (the level map) is
-snapshotted in the catalog. Without `max_cell_rows` the grid is fixed at
-level 0 — exactly the formula above. See
-[docs/release-0.2-adaptive-row-grid.md](docs/release-0.2-adaptive-row-grid.md).
+With `.max_cell_rows(n)`, row is one candidate split axis:
+`row_bucket = floor(row_id · 2^level / chunk_rows)`, with children `2b` and
+`2b+1` at `level+1`. A row split applies to the whole row leaf and copies its
+local hash/range topology into both children. Without `max_cell_rows` every
+axis stays at level zero. See
+[docs/release-0.5-adaptive-multidimensional-grid.md](docs/release-0.5-adaptive-multidimensional-grid.md).
 
 ### 2. Column groups (vertical partitioning)
 
@@ -131,6 +139,8 @@ bucket = xxh3_64(value.as_bytes()) % num_buckets
 A filter `sensor_id = 'sensor_3'` computes
 the bucket, allowing the query engine to skip non-matching chunks. Multiple
 hash dimensions are supported (the coordinate stores one bucket per dimension).
+Inside an overflowing cell, a hash split doubles only that axis's local
+modulus: `num_buckets * 2^hash_level` (extendible hashing).
 
 ### 4. Range dimensions
 
@@ -145,7 +155,10 @@ bucket = i64_to_ordered_u64(value.div_euclid(chunk_size))
 converts the signed bucket index to an ordered u64. Negative values
 (e.g., timestamps before epoch) land in contiguous, correctly ordered buckets.
 A filter `timestamp BETWEEN 3600 AND 7200` maps to a set of overlapping
-buckets, and only those chunks are read.
+buckets, and only those chunks are read. A local range split increases that
+coordinate's resolution using
+`floor(value * 2^range_level / chunk_size)`; pruning compares each coordinate
+at its own level.
 
 ### On-disk layout
 
@@ -155,15 +168,17 @@ buckets, and only those chunks are read.
 │   ├── chunks/
 │   │   ├── chunk_r0_c0_h7_rg4610_v1.parquet
 │   │   ├── chunk_r0_c1_h7_rg4610_v1.parquet
-│   │   ├── chunk_r5_l2_c0_h3_rg4611_v2.parquet   <-- split cell (level 2)
+│   │   ├── chunk_r5_l2_c0_h3_hl1_rg4611_rgl2_v2.parquet
 │   │   └── ...
 ├── catalog/             <-- sled KV store
 ├── wal/
 │   └── patches.wal      <-- write-ahead log (updates/deletes + hot buffer)
 ```
 
-Filename format: `chunk_r{row}[_l{level}]_c{col}_h{hash0}-{hash1}_rg{range0}_v{version}.parquet`
-(`_l` omitted at level 0).
+Filename format:
+`chunk_r{row}[_l{row-level}]_c{col}_h{buckets}[_hl{levels}]_rg{buckets}[_rgl{levels}]_v{version}.parquet`.
+Level components containing only zeroes are omitted, so legacy names still
+parse as an unrefined coordinate.
 
 ---
 
@@ -178,10 +193,10 @@ and chunking configuration.
 The catalog holds all chunk coordinates. The pruner eliminates coordinates
 that cannot match:
 
-- **Hash pruning**: filter `sensor_id = X` -> compute bucket, discard
-  non-matching chunks.
-- **Range pruning**: filter `timestamp BETWEEN a AND b` -> enumerate
-  overlapping buckets, discard the rest. One-sided filters (e.g.,
+- **Hash pruning**: filter `sensor_id = X` -> compute the bucket at each
+  candidate's local level, discard non-matching chunks.
+- **Range pruning**: filter `timestamp BETWEEN a AND b` -> test overlap at
+  each candidate's local level, discard the rest. One-sided filters (e.g.,
   `timestamp > X`) are bounded using global min/max statistics tracked
   by the catalog.
 - **Column-group pruning**: only read groups that contain requested columns.
@@ -213,8 +228,9 @@ let config = TableBuilder::new("events", "/tmp/mydb")
     .add_column("timestamp", "Int64", false)
     .add_column("sensor_id", "Utf8", false)
     .add_column("value", "Int64", true)
-    .chunk_rows(100_000)
-    .add_hash_dimension("sensor_id", 50)
+    .chunk_rows(1_000_000)          // deliberately coarse level-zero row grid
+    .add_hash_dimension("sensor_id", 4)
+    .max_cell_rows(100_000)         // refine row/hash/range on overflow
     .with_primary_key_as_row_id("timestamp")
     .build();
 
@@ -363,17 +379,17 @@ On a 128-column table, `COUNT(*)` reads 1-2 columns instead of 128. The effectiv
 ```
 db.insert("events", &batch)
   -> generate __row_id (based on strategy)
-  -> compute hash_bucket per row (xxh3 % N)
-  -> compute range_bucket per row (div_euclid)
-  -> route row cell via the level map (level 0 formula unless the cell split)
-  -> group rows by (row_bucket, level, col_group, hash_buckets, range_buckets)
+  -> compute raw hash/range values
+  -> route the row leaf through LevelMap
+  -> descend its local hash/range DimensionMap
+  -> group rows by full CellCoordinate + column group
   -> for each coordinate:
        if coordinate already exists in catalog:
          read existing parquet, concat, dedup by __row_id (merge-on-write)
-       write parquet file (SNAPPY compressed)
+       sort by range/hash/__row_id; write bounded row groups + Bloom filters
        update catalog version
   -> flush catalog
-  -> adaptive grid: split any row cell whose file exceeded max_cell_rows
+  -> for each overflow: measure every valid axis and split recursively
 
 db.insert_buffered / StreamInserter::write
   -> assign __row_id, fsync the batch to the WAL (hot buffer)
@@ -384,6 +400,9 @@ db.update_rows / db.delete_rows
   -> flush the hot buffer, route by row cell
   -> fsync a patch record to the WAL (no Parquet rewrite)
   -> applied merge-on-read at query time; materialized by compaction/splits
+
+db.compact / db.rebalance
+  -> materialize patches, then coalesce underfilled local sibling leaves
 ```
 
 ### Read path
@@ -394,7 +413,7 @@ db.select(...).filter(...).execute()
   -> prune_chunks():
        load all coordinates from catalog
        eliminate by hash, range, column group, version
-  -> group surviving chunks by RowKey (row_bucket + level + hash + range)
+  -> group surviving chunks by RowKey (row + every bucket/local level)
   -> parallel scan (Tokio async + Rayon):
        for each RowKey:
          chunk cache hit? serve cached batch (+ patch delta)
@@ -434,7 +453,8 @@ Backed by [sled](https://github.com/spacejam/sled) (embedded persistent KV store
 | `__next_row_id__` | Snowflake allocator |
 | `__table_config__<name>` | Persisted TableConfig |
 | `__range_stats__<table>_<col>` | Global min/max per range dimension |
-| level map snapshot per table | Refined cells of the adaptive row grid |
+| level map snapshot per table | Refined row cells |
+| dimension map snapshot per table | Local hash/range internal nodes and split axes |
 
 Updates, deletes and the hot buffer live in the WAL-backed `PatchLog`
 (`wal/patches.wal`): every mutation is fsynced before it is acknowledged,
@@ -451,24 +471,25 @@ src/
   config/table_config.rs   TableConfig, TableBuilder, RowIdStrategy
   catalog/
     version_catalog.rs     Sled-backed version tracking, row ID allocation,
-                           level map snapshots, atomic split commit
-    hash_registry.rs       xxh3 hash bucketing
+                           topology snapshots, atomic split/merge commits
+    hash_registry.rs       Level-aware xxh3 hash bucketing
     range_stats.rs         Global min/max statistics per range dimension
   storage/
-    chunk_coord.rs         ChunkCoordinate (incl. level), ChunkInfo
+    chunk_coord.rs         CellCoordinate, adaptive ChunkCoordinate, ChunkInfo
     chunk_naming.rs        Filename format/parse, chunk_path()
-    parquet_writer.rs      write_parquet() (SNAPPY)
+    parquet_writer.rs      Sort, bounded row groups, Bloom filters, SNAPPY
     chunk_cache.rs         In-memory cache of merged chunks (per tx snapshot)
   partitioning/
     row_index.rs           bucket_at_level(), cell_row_range(), split math
     level_map.rs           Adaptive row grid: refined cells + routing guard
-    range_dim.rs           range_bucket(), overlapping_buckets()
+    dimension_map.rs       Persistent local hash/range refinement tree
+    range_dim.rs           Level-aware range buckets and overlap
     column_groups.rs       ColumnGroupMapper
   concurrency/
     compaction_lock.rs     Per-cell mutual exclusion (splits vs compaction)
   write/
-    batch_insert.rs        BatchInserter: write pipeline, merge-on-write,
-                           cell splits, hot buffer (buffer_insert/flush_hot)
+    batch_insert.rs        Routing, merge-on-write, split chooser, local
+                           split/merge, hot buffer materialization
     stream_insert.rs       StreamInserter over the hot buffer
     patch_log.rs           PatchLog: update/delete/insert journal
     patch_wal.rs           WAL backing the PatchLog (fsync, replay, checkpoint)
@@ -502,31 +523,32 @@ src/
 ## Tests and examples
 
 ```bash
-cargo test                                      # 78 tests (60 unit + 18 integration)
+cargo test                                      # 102 active tests
 cargo run --example playground --release        # interactive demo
 cargo run --example query_benchmark --release   # simple query benchmark
 
 # ChunkDB vs DuckDB comparison (8 query patterns)
-cargo run --release --example chunkdb_vs_duckdb_benchmark -- \
+cargo run --release --features duckdb-benchmark --example chunkdb_vs_duckdb_benchmark -- \
   -r 2000000 -c 50 -s 200 --hash-buckets 20 --chunk-rows 50000 \
   --column-groups -b 10 -w 3
 ```
 
 See [`examples/README.md`](examples/README.md) for the full list of examples and API reference.
 
-### Benchmark snapshot (2M rows, 50 columns, 200 sensors, column groups enabled)
+### Current benchmark verdict
 
-| Query | ChunkDB | DuckDB-Native | DuckDB-Parquet | vs Native | vs Parquet |
-|---|---|---|---|---|---|
-| `WHERE sensor AND ts (1%)` | **3.63ms** | 6.63ms | 150.70ms | **1.8x** | **41.5x** |
-| `WHERE ts BETWEEN (1%)` | **26.71ms** | 17.18ms | 163.22ms | -1.6x | **6.1x** |
-| `WHERE sensor = X` | **96.64ms** | 15.59ms | 153.53ms | -6.2x | **1.6x** |
-| `WHERE ts BETWEEN (10%)` | 259.24ms | 61.41ms | 158.75ms | -4.2x | -1.6x |
-| `SELECT * (full scan)` | 2042.04ms | 245.27ms | 418.41ms | -8.3x | -4.9x |
+The Phase 3 benchmark varies uniform/Zipf data and ordered/UUID row IDs. On
+500k rows, the adaptive grid reduces the uniform ordered layout from 832 files
+(100% small) to 68 files (4.4% small), and an equality filter on the hash key
+runs in 0.757ms versus 16.721ms for the sorted-Parquet baseline. The same
+baseline remains substantially faster on time ranges and full scans.
 
-*DuckDB-Native = DuckDB's proprietary columnar format; DuckDB-Parquet = DuckDB reading standard Parquet files.*
-
-ChunkDB outperforms DuckDB-Parquet on selective queries (1.6x-41.5x), and beats even DuckDB's native format on the combined hash+range filter (1.8x). Full scans are slower due to the small-files overhead. These benchmarks have known gaps — they do not vary data distributions, bucket skew, or selectivity curves systematically — but they suggest the approach can be competitive on its target workload. See [`benchmarks/README.md`](benchmarks/README.md) for the full 8-query breakdown and analysis.
+With UUID or Zipf data, 92-100% of adaptive files can still be underfilled:
+split-on-overflow cannot coalesce level-zero cells that started too small. The
+project is therefore promising as a selective-query layout, but is not yet a
+general-purpose HTAP engine. See the complete methodology, raw results and
+go/no-go decision in
+[`docs/decisive-tests-and-verdict.md`](docs/decisive-tests-and-verdict.md).
 
 ### Benchmarks
 
@@ -544,23 +566,21 @@ See [`benchmarks/README.md`](benchmarks/README.md) for full documentation, param
 
 | Area | Covers |
 |---|---|
-| Unit tests (inline, 60) | Bucketing math incl. levels and negatives, filename parse/format round-trip, level map routing/snapshots, patch log + WAL replay/truncation/corrupt tail, patch application and projection, cache, range stats |
+| Unit tests (inline, 74) | Row/hash/range refinement math, topology snapshots, legacy migration, filenames, patch WAL/application, cache and range stats |
 | Query/write integration | Multi-batch insert, pruning, all filter ops, aggregations, projections, OR, limit, column groups + vertical join, negative timestamps |
-| Mutations & durability | Updates/deletes with snapshot isolation, compaction (incl. newer-patch preservation), WAL replay across reopen, hot buffer visibility/durability/flush, GC of superseded files |
-| Adaptive grid | Split on overflow, compact-on-split, reopen with level map, column-group updates across split/compaction |
+| Mutations & concurrency | Snapshot-safe cache, updates/deletes, partition-key rejection, WAL replay, concurrent insert/compaction and GC |
+| Adaptive grid | Row/hash/range split, exact level-aware pruning, reopen, column groups, sibling merge, physical sort/row groups and concurrent routing |
 
 ---
 
 
 ## Configuration tuning
 
-> **Note (2026-07):** the adaptive row grid makes most of the manual tuning
-> below unnecessary on the row axis — set a coarse `chunk_rows` plus
-> `.max_cell_rows(n)` and let cells split where data is dense. The guidelines
-> below still apply to hash/range dimensions (which do not split yet) and to
-> tables running with the fixed grid. Per the agreed direction
-> ([docs/architecture-evolution.md](docs/architecture-evolution.md)) this
-> whole section is slated for obsolescence.
+> **Note (2026-08):** `.max_cell_rows(n)` enables adaptive split on row, hash
+> and range axes. Start with a deliberately coarse base grid: the engine can
+> refine an oversized cell, but it cannot yet pack unrelated underfilled base
+> cells together. The empirical rules below describe fixed-grid behavior and
+> should not be used as adaptive defaults.
 
 Performance appears to be sensitive to chunking parameters. Since dimensions
 interact (the actual chunk content is the intersection of all dimension
@@ -576,7 +596,7 @@ on preliminary observations and may not generalize to all workloads.
 
 **Trade-off**: Large chunks → fewer files, slower range queries. Small chunks → more files, file opening overhead.
 
-**Empirical rule**:
+**Historical fixed-grid rule**:
 ```
 chunk_rows × num_hash_buckets ≈ total_rows / 10-50
 ```
@@ -601,9 +621,10 @@ File opening has ~0.1-0.5ms overhead. With 1000+ files, queries spend more time 
 
 **Trade-off**: More buckets → better pruning granularity, more files. Fewer buckets → wider scans, fewer files.
 
-**Empirical rule**: Match hash dimension cardinality when known:
-- 50 sensors → `num_buckets = 50` (1 sensor per bucket)
-- 1000 sensors → `num_buckets = 100-200` (5-10 sensors per bucket)
+**Adaptive starting point**: use a small base fanout (often 2-8), then let
+local extendible-hash splits increase resolution only in overflowing cells.
+Matching bucket count to cardinality is appropriate only when dedicated small
+files are intentional.
 
 **File count impact**: Each hash bucket creates a separate file per (row_bucket, col_group, range_bucket). With 100 hash buckets, 10 row buckets, 3 column groups = 3,000 files.
 
@@ -651,25 +672,41 @@ to store separately blocks of columns.
 
 ### Open issues
 
-1. **Small files problem (hash/range axes)** — the adaptive row grid (0.2) fixes this on the row axis, but hash and range dimensions still partition with a fixed modulo/width: a rare hash value in a given row cell still produces a tiny file. Multi-dimensional splits (extendible hashing) are Phase 3 of [docs/architecture-evolution.md](docs/architecture-evolution.md).
+1. **Underfilled base cells** — row/hash/range splits now handle overflow, and
+   local siblings can merge back, but unrelated level-zero cells cannot be
+   packed together. A base grid that starts too fine still creates many small
+   files, especially with UUID and skewed dimensions.
 2. **GC is manual** — `collect_garbage()` removes superseded versions and pre-split parents, but nothing schedules it; and a long-running query that snapshotted its chunk list before a GC can fail if its files are collected under it.
 3. **Hardcoded concurrency** — Semaphore limit (128) not configurable.
-4. **Silent type fallback in `parse_data_type()`** — Unknown type strings fall back to Utf8 instead of returning an error.
-5. **Hash bucketing limited to Utf8 and Int64** — Other column types (UInt64, Float64) silently assign bucket 0, disabling hash pruning for those types.
-6. **Catalog scan on every query** — `all_chunks()` performs an O(n) scan of the sled catalog (mitigated by an in-memory chunk index). Level-aware descent is planned to replace it.
+4. **Catalog enumeration on every query** — `all_chunks()` is served by an
+   in-memory index, but pruning still starts from every live coordinate rather
+   than walking only predicate-compatible leaves.
+5. **Serialized writers** — a per-table lock makes insert, compaction and
+   rebalance correct, but limits write concurrency.
+6. **Bloom filters are write-only** — hash keys and `__row_id` receive Parquet
+   Bloom filters, but the direct executor currently uses only coordinate and
+   row-group-statistics pruning.
 7. **Chunk files ride the OS page cache** — Parquet writes and the sled catalog are not fsynced per insert; an acknowledged `insert()` can be lost on power failure (not on process crash). `insert_buffered` (WAL-backed) is the durable path; a chunk-file fsync policy is future work.
 
 
 
 ### Limitations
 
-- **Experimental status**: This is a research prototype. APIs and storage format may change between versions (0.2 broke the catalog format, no migration). Expect undiscovered bugs — the project is under active development and has not been battle-tested in production.
+- **Experimental status**: This is a research prototype. APIs and storage
+  formats may change; level-zero coordinate keys have a migration path, but
+  there is no general on-disk format migration framework.
 - **Updates/deletes are patch-based**: `update_rows`/`delete_rows` journal patches applied merge-on-read; heavy un-compacted patch volume slows reads until compaction. Updates must carry the full table schema.
-- **Dimension interaction**: Chunk dimensions are not independent in practice — the actual chunk size is the intersection of all dimensions, which can produce many undersized files on the hash/range axes (see issue #1 above).
+- **Dimension interaction**: Chunk size is the intersection of every axis.
+  Adaptive refinement prevents oversized leaves; it cannot yet combine sparse
+  base intersections into one physical segment.
+- **Partition-key updates do not relocate**: an update that would change its
+  hash/range cell is rejected explicitly; perform delete + insert instead.
 - **OR conditions**: Fully implemented but may read duplicate chunks (deduplication happens post-read).
 - **String filters**: Only `Eq` and `NotEq` have row-level implementations. Other operators return errors.
 - **No distributed mode**: Single-node only. Catalog is local sled DB.
-- **Snapshot isolation is patch-level only**: queries see patches up to their snapshot transaction, but concurrent merge-on-write inserts to the same coordinate are visible as soon as the catalog version bumps.
+- **Snapshot isolation is patch-level only**: queries see patches up to their
+  snapshot transaction, but base Parquet rewrites are represented only by the
+  latest catalog version, not a complete historical MVCC chain.
 - **Batch-in-memory reads**: Queries currently materialize all matching chunks into `Vec<RecordBatch>` in memory before returning. For large result sets this can cause high memory usage. A streaming approach (returning an async `RecordBatchStream` that yields batches lazily as chunks are read) is planned but not yet implemented.
 - **Query API surface**: The current filter API (`Filter::eq`, `Filter::between`, `.or()`) covers common cases but remains low-level and verbose for complex predicates. A future goal is to simplify the API (e.g., more ergonomic compound filters, builder-style predicates) and extend operator coverage (e.g., `IN`, `LIKE`, range operators on strings). This is not urgent but would improve usability.
 
@@ -686,15 +723,17 @@ before proposing structural changes. Progress against its phased plan:
 | 1 | WAL-backed PatchLog (durable updates/deletes) | ✅ release 0.3 — [docs/release-0.3-patch-wal.md](docs/release-0.3-patch-wal.md) |
 | 1 | Queryable hot buffer + insert-side WAL, orphan GC | ✅ release 0.4 — [docs/release-0.4-hot-buffer-gc.md](docs/release-0.4-hot-buffer-gc.md) |
 | 2 | Adaptive row grid (`level` in coordinates, split-on-overflow, compact-on-split) | ✅ release 0.2 — [docs/release-0.2-adaptive-row-grid.md](docs/release-0.2-adaptive-row-grid.md) |
-| 3 | Multi-dimension splits (extendible hashing), merge of undersized cells, in-file sort + bloom filters, zone maps | ⏳ next |
-| 4 | Workload-driven splits (qd-tree style) | optional / research |
+| 3 | Local hash/range splits, sibling merge, in-file sort, bounded row groups and Bloom writes | ✅ release 0.5 — [docs/release-0.5-adaptive-multidimensional-grid.md](docs/release-0.5-adaptive-multidimensional-grid.md) |
+| Next | Logical-cell to packed-segment directory, immutable deltas and manifest MVCC | required by benchmark verdict |
+| 4 | Workload-driven splits (qd-tree style) | optional / research, after packing |
 
 Earlier releases also shipped an in-memory chunk cache and background
 auto-compaction. The 0.2 code review and its gap analysis live in
 [docs/review-0.2-code-review.md](docs/review-0.2-code-review.md).
 
-Operational backlog (not phase-bound): fsync policy for chunk files,
-scheduled GC, streaming reads (`RecordBatchStream`), configurable concurrency,
-group-commit for the WAL, broader filter/type coverage. A SQL:2023 MDA
+Operational backlog (not phase-bound): query-time Bloom consumption,
+formula-only candidate enumeration, fsync policy for chunk files, scheduled
+GC, streaming reads (`RecordBatchStream`), configurable concurrency,
+group-commit for the WAL and broader filter/operator coverage. A SQL:2023 MDA
 (multi-dimensional array) syntax layer over the coordinate model remains an
 exploratory idea.

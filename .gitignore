@@ -20,3 +20,4 @@ __pycache__/
 benchmark_results.csv
 benchmark_summary.txt
 benchmark_scaling_analysis.txt
+/benchmarks/results/

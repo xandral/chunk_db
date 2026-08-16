@@ -9,6 +9,7 @@ Benchmark infrastructure for evaluating ChunkDB's performance across different c
 | **Parametric sweep** | 1000 combinations of `chunk_rows`, `hash_buckets`, `range_dim_size` on a 1M-row dataset | `run_parametric.sh` |
 | **Column scaling** | Performance vs number of columns selected (1 to 127), with 128 columns in 4 groups | `run_scaling.sh` |
 | **Column groups** | Parametric sweep on a wide (128-col, 4-group) table to measure vertical join overhead | `run_colgroups.sh` |
+| **Decisive layout test** | Fixed vs adaptive grid vs sorted Parquet under uniform/Zipf data and ordered/UUID IDs | Run directly (see below) |
 | **ChunkDB vs DuckDB** | Head-to-head comparison across 8 query patterns with configurable parameters | Run directly (see below) |
 
 ## Quick Start
@@ -39,10 +40,10 @@ This benchmark is run directly via `cargo run` from the project root:
 
 ```bash
 # Default: 1M rows, 20 columns, 100 sensors, 10 hash buckets
-cargo run --release --example chunkdb_vs_duckdb_benchmark
+cargo run --release --features duckdb-benchmark --example chunkdb_vs_duckdb_benchmark
 
 # Customized run
-cargo run --release --example chunkdb_vs_duckdb_benchmark -- \
+cargo run --release --features duckdb-benchmark --example chunkdb_vs_duckdb_benchmark -- \
   -r 200000 -c 30 -s 50 --chunk-rows 5000 --hash-buckets 10 \
   --column-groups -b 5 -w 2
 ```
@@ -61,6 +62,25 @@ cargo run --release --example chunkdb_vs_duckdb_benchmark -- \
 | `-w` | `--warmup-runs` | 3 | Warmup runs (not counted) |
 
 The benchmark runs 8 query patterns (full scan, single sensor, time ranges, combined filters, OR conditions, projections) and prints a comparison table.
+
+### Decisive layout benchmark
+
+This is the short, reproducible gate for the storage hypothesis. It validates
+query results and records file counts, small-unit ratio, live/orphan bytes,
+candidate compressed bytes, and warm latency.
+
+```bash
+cargo run --release --example decisive_layout_benchmark -- \
+  --profile quick --output benchmarks/results/decisive_quick_phase3.csv
+cargo run --release --example decisive_layout_benchmark -- \
+  --profile full --output benchmarks/results/decisive_full_phase3.csv
+```
+
+Each run produces 60 validated measurements (two distributions × two ID modes
+× three layouts × five queries). Generated CSV files under
+`benchmarks/results/` are intentionally ignored by Git; the runner exits on
+any result-count mismatch. The design, recorded results and go/no-go criteria are in
+[`docs/decisive-tests-and-verdict.md`](../docs/decisive-tests-and-verdict.md).
 
 ## File Index
 
@@ -101,7 +121,7 @@ See [INTERPRETING_RESULTS.md](INTERPRETING_RESULTS.md) for a detailed guide on r
 Run command:
 
 ```bash
-cargo run --release --example chunkdb_vs_duckdb_benchmark -- \
+cargo run --release --features duckdb-benchmark --example chunkdb_vs_duckdb_benchmark -- \
   --num-rows 2000000 --num-columns 50 --num-sensors 200 \
   --hash-buckets 20 --chunk-rows 50000 --column-groups \
   -b 10 -w 3
@@ -139,4 +159,10 @@ The results suggest that ChunkDB's approach may be most effective for **highly s
 
 ### Where does it fall short?
 
-For **full scans** and **low-selectivity queries**, the many-small-files layout appears to be a significant disadvantage. DuckDB's sequential scan path, vectorized execution, and optimized representation are better suited to these workloads. The gap between DuckDB-Native and DuckDB-Parquet on full scans (245ms vs 418ms) shows that even DuckDB pays a price for Parquet I/O — ChunkDB pays a larger one because it must open many files instead of one. This raises questions about whether adaptive chunk sizing or background compaction could mitigate the overhead.
+For **full scans** and **low-selectivity queries**, the many-small-files layout
+is a significant disadvantage. DuckDB's sequential scan path, vectorized
+execution, and optimized representation are better suited to these workloads.
+The Phase 3 decisive test confirms that adaptive splitting helps overloaded
+cells but cannot pack unrelated, underfilled base cells. The next relevant
+experiment is therefore logical-cell to physical-segment packing, not another
+split threshold.

@@ -3,6 +3,13 @@ name = "chunk_db"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# DuckDB is only needed by the explicit comparison benchmark. Keeping it out
+# of the default test graph avoids compiling the bundled C++ engine for every
+# `cargo test` invocation.
+duckdb-benchmark = ["dep:duckdb"]
+
 [dependencies]
 # Arrow ecosystem
 arrow = { version = "53", features = ["prettyprint"] }
@@ -28,12 +35,14 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror = "1"
 tracing = "0.1"
 
+# Optional baseline used by `chunkdb_vs_duckdb_benchmark` only.
+duckdb = { version = "1.0", features = ["bundled"], optional = true }
+
 # Parallelism
 rayon = "1.10"
 
 [dev-dependencies]
 tempfile = "3"
-duckdb = { version = "1.0", features = ["bundled"] }
 serde_json = "1.0"
 glob = "0.3"
 rayon = "1.10"
@@ -58,4 +67,4 @@ path = "examples/playground.rs"
 [[example]]
 name = "chunkdb_vs_duckdb_benchmark"
 path = "examples/chunkdb_vs_duckdb_benchmark.rs"
-
+required-features = ["duckdb-benchmark"]

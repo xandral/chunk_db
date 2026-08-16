@@ -15,6 +15,8 @@ pub struct RowKey {
     pub level: u16,
     pub hash_buckets: Vec<u64>,
     pub range_buckets: Vec<u64>,
+    pub hash_levels: Vec<u16>,
+    pub range_levels: Vec<u16>,
 }
 
 impl From<&ChunkCoordinate> for RowKey {
@@ -24,6 +26,8 @@ impl From<&ChunkCoordinate> for RowKey {
             level: coord.level,
             hash_buckets: coord.hash_buckets.clone(),
             range_buckets: coord.range_buckets.clone(),
+            hash_levels: coord.hash_levels.clone(),
+            range_levels: coord.range_levels.clone(),
         }
     }
 }
@@ -32,8 +36,14 @@ impl RowKey {
     /// Chunk-cache key for this row cell. Shared by the executor (lookups)
     /// and the write path (invalidation on merge-on-write and split).
     pub fn cache_key(&self, table: &str) -> Vec<u8> {
-        format!("rk:{}:{}:{}:{:?}:{:?}",
-            table, self.level, self.row_bucket, self.hash_buckets, self.range_buckets)
+        format!("rk:{}:{}:{}:{:?}:{:?}:{:?}:{:?}",
+            table,
+            self.level,
+            self.row_bucket,
+            self.hash_buckets,
+            self.hash_levels,
+            self.range_buckets,
+            self.range_levels)
             .into_bytes()
     }
 }
@@ -305,5 +315,4 @@ pub fn apply_projection(
     let final_schema = Arc::new(Schema::new(final_fields));
     RecordBatch::try_new(final_schema, final_columns).map_err(Into::into)
 }
-
 

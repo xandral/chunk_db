@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{HashRegistry, VersionCatalog, RangeDimensionStats};
 use crate::config::table_config::{TableConfig, RowIdStrategy};
-use crate::partitioning::{ColumnGroupMapper, cell_row_range, overlapping_buckets, i64_to_ordered_u64};
+use crate::partitioning::{
+    cell_row_range, i64_to_ordered_u64, range_bucket_overlaps, ColumnGroupMapper,
+};
 use crate::query::filter::{Filter, FilterOp, FilterValue};
 use crate::storage::ChunkInfo;
 use crate::Result;
@@ -52,14 +54,18 @@ impl<'a> PredicateExtractor<'a> {
     }
 
     /// Extract equality predicates for hash dimensions
-    /// Returns (column_name, FilterValue) tuples preserving type information
-    pub fn extract_hash_predicates(&self, filters: &[Filter]) -> Vec<(String, FilterValue)> {
+    /// Returns (dimension_index, column_name, FilterValue) tuples preserving
+    /// both type information and the configured dimension position.
+    pub fn extract_hash_predicates(
+        &self,
+        filters: &[Filter],
+    ) -> Vec<(usize, String, FilterValue)> {
         let mut predicates = vec![];
 
-        for dim in &self.config.partitioning.hash_dimensions {
+        for (dim_idx, dim) in self.config.partitioning.hash_dimensions.iter().enumerate() {
             for filter in filters {
                 if filter.column == dim.column && filter.op == FilterOp::Eq {
-                    predicates.push((dim.column.clone(), filter.value.clone()));
+                    predicates.push((dim_idx, dim.column.clone(), filter.value.clone()));
                     break;
                 }
             }
@@ -156,45 +162,69 @@ pub fn prune_chunks(
             stats_map.get(col_name),
         );
 
-        // Skip range pruning if the range is too large (unbounded)
-        let Some(valid_buckets_vec) = overlapping_buckets(effective_min, effective_max, dim.chunk_size) else {
+        // Statistics did not provide finite bounds: over-inclusion is the
+        // only safe choice. Otherwise compare at each coordinate's own level.
+        if effective_min == i64::MIN || effective_max == i64::MAX {
             continue;
-        };
-        let valid_buckets: HashSet<u64> = valid_buckets_vec.into_iter().collect();
-
-        candidates.retain(|chunk| {
-            if chunk.coord.range_buckets.len() > dim_idx {
-                valid_buckets.contains(&chunk.coord.range_buckets[dim_idx])
+        }
+        let mut filtered = Vec::with_capacity(candidates.len());
+        for chunk in candidates {
+            if let Some(&bucket) = chunk.coord.range_buckets.get(dim_idx) {
+                let level = chunk.coord.range_levels.get(dim_idx).copied().unwrap_or(0);
+                if range_bucket_overlaps(
+                    bucket,
+                    level,
+                    effective_min,
+                    effective_max,
+                    dim.chunk_size,
+                )? {
+                    filtered.push(chunk);
+                }
             } else {
-                true
+                // Legacy/malformed coordinates are conservatively retained.
+                filtered.push(chunk);
             }
-        });
+        }
+        candidates = filtered;
     }
 
     // 4. Hash dimension pruning
     let hash_predicates = extractor.extract_hash_predicates(filters);
-    for (i, (_col_name, value)) in hash_predicates.iter().enumerate() {
-        if i >= hash_registries.len() {
+    for (dim_idx, _col_name, value) in &hash_predicates {
+        if *dim_idx >= hash_registries.len() {
             continue;
         }
 
-        // Use appropriate lookup method based on value type
-        let bucket = match value {
-            FilterValue::String(s) => hash_registries[i].lookup_bucket(s)?,
-            FilterValue::Int(n) => hash_registries[i].lookup_bucket_numeric(*n)?,
-            FilterValue::UInt(n) => hash_registries[i].lookup_bucket_numeric(*n as i64)?,
-            FilterValue::Bool(b) => hash_registries[i].lookup_bucket(&b.to_string())?,
-        };
-
-        if let Some(bucket) = bucket {
-            candidates.retain(|chunk| {
-                if chunk.coord.hash_buckets.len() > i {
-                    chunk.coord.hash_buckets[i] == bucket
-                } else {
-                    true
+        let mut bucket_by_level = HashMap::new();
+        for chunk in &candidates {
+            let level = chunk.coord.hash_levels.get(*dim_idx).copied().unwrap_or(0);
+            if bucket_by_level.contains_key(&level) {
+                continue;
+            }
+            let bucket = match value {
+                FilterValue::String(s) => {
+                    hash_registries[*dim_idx].lookup_bucket_at_level(s, level)?
                 }
-            });
+                FilterValue::Int(n) => {
+                    hash_registries[*dim_idx].lookup_bucket_numeric_at_level(*n, level)?
+                }
+                FilterValue::UInt(n) => {
+                    hash_registries[*dim_idx]
+                        .lookup_bucket_numeric_at_level(*n as i64, level)?
+                }
+                FilterValue::Bool(value) => {
+                    hash_registries[*dim_idx].lookup_bucket_bool_at_level(*value, level)?
+                }
+            };
+            bucket_by_level.insert(level, bucket);
         }
+        candidates.retain(|chunk| {
+            let Some(&actual) = chunk.coord.hash_buckets.get(*dim_idx) else {
+                return true;
+            };
+            let level = chunk.coord.hash_levels.get(*dim_idx).copied().unwrap_or(0);
+            bucket_by_level.get(&level).copied() == Some(actual)
+        });
     }
 
     // 5. Column projection pruning
@@ -212,16 +242,10 @@ pub fn prune_chunks(
     candidates.retain(|chunk| required_groups.contains(&chunk.coord.col_group));
 
     // 6. Version resolution
-    let mut latest_by_coord: HashMap<(u64, u16, u16, Vec<u64>, Vec<u64>), ChunkInfo> = HashMap::new();
+    let mut latest_by_coord: HashMap<crate::storage::ChunkCoordinate, ChunkInfo> = HashMap::new();
 
     for chunk in candidates {
-        let key = (
-            chunk.coord.row_bucket,
-            chunk.coord.level,
-            chunk.coord.col_group,
-            chunk.coord.hash_buckets.clone(),
-            chunk.coord.range_buckets.clone(),
-        );
+        let key = chunk.coord.clone();
 
         latest_by_coord
             .entry(key)

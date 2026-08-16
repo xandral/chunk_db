@@ -15,6 +15,7 @@ use crate::query::filter::{Filter, FilterOp, FilterValue};
 use crate::query::chunk_merger::{group_chunks_by_row_key, vertical_join, RowKey};
 use crate::query::pruning::prune_chunks;
 use crate::write::{PatchLog, PatchOp, apply_patches};
+use crate::write::patch_apply::project_patches_to_schema;
 use crate::api::database::{hot_buffer_key, patch_key};
 use crate::Result;
 use futures::stream::FuturesUnordered;
@@ -340,45 +341,65 @@ impl DirectExecutor {
         let pk = patch_key(&self.config.name, row_key.level, row_key.row_bucket);
         let ck = row_key.cache_key(&self.config.name);
 
+        // A cache entry contains a vertically joined, full-width row cell.
+        // Projected scans may have pruned column groups, so sharing the same
+        // cache key with them would return the wrong schema/columns.
+        let cache_eligible = projection.is_none();
+
         // --- Try cache first ---
-        if let Some((cached_batch, cached_tx)) = self.chunk_cache.get_with_tx(&ck) {
-            if cached_tx >= self.snapshot_tx_id {
-                // Exact (or newer) hit — use cached, just filter + return
-                let mut result = vec![cached_batch];
-                if !filters.is_empty() {
-                    result = result.into_iter()
-                        .map(|b| apply_row_filters(b, filters))
-                        .collect::<Result<Vec<_>>>()?;
+        if cache_eligible {
+            if let Some((cached_batch, cached_tx)) = self.chunk_cache.get_with_tx(&ck) {
+                if cached_tx == self.snapshot_tx_id {
+                    // Exact snapshot hit — use cached, just filter + return.
+                    let mut result = vec![cached_batch];
+                    if !filters.is_empty() {
+                        result = result.into_iter()
+                            .map(|b| apply_row_filters(b, filters))
+                            .collect::<Result<Vec<_>>>()?;
+                    }
+                    return Ok(result);
                 }
-                return Ok(result);
-            }
 
-            // Stale hit — apply only the delta (cached_tx .. snapshot_tx_id]
-            let delta = self.patch_log.get_patches_between(&pk, cached_tx, self.snapshot_tx_id);
-            if delta.is_empty() {
-                // No new patches since cache was built — still valid
-                let mut result = vec![cached_batch];
-                if !filters.is_empty() {
-                    result = result.into_iter()
-                        .map(|b| apply_row_filters(b, filters))
-                        .collect::<Result<Vec<_>>>()?;
+                // A future cache entry must never leak into an older snapshot.
+                // Bypass it and rebuild from disk plus patches visible to this
+                // executor. (Base-file MVCC remains a separate limitation.)
+                if cached_tx > self.snapshot_tx_id {
+                    // Fall through to the disk path.
+                } else {
+                    // Stale hit — apply only the delta
+                    // (cached_tx .. snapshot_tx_id].
+                    let delta = self.patch_log.get_patches_between(
+                        &pk,
+                        cached_tx,
+                        self.snapshot_tx_id,
+                    );
+                    if delta.is_empty() {
+                        // No new patches since cache was built — still valid.
+                        let mut result = vec![cached_batch];
+                        if !filters.is_empty() {
+                            result = result.into_iter()
+                                .map(|b| apply_row_filters(b, filters))
+                                .collect::<Result<Vec<_>>>()?;
+                        }
+                        return Ok(result);
+                    }
+
+                    // Apply delta patches and advance the cache snapshot.
+                    let projected = project_patches_to_schema(&delta, &cached_batch.schema())?;
+                    let updated = apply_patches(cached_batch, &projected)?;
+                    self.chunk_cache.put(ck.clone(), updated.clone(), self.snapshot_tx_id);
+                    let mut result = vec![updated];
+                    if !filters.is_empty() {
+                        result = result.into_iter()
+                            .map(|b| apply_row_filters(b, filters))
+                            .collect::<Result<Vec<_>>>()?;
+                    }
+                    return Ok(result);
                 }
-                return Ok(result);
             }
-
-            // Apply delta patches, update cache
-            let updated = apply_patches(cached_batch, &delta)?;
-            self.chunk_cache.put(ck, updated.clone(), self.snapshot_tx_id);
-            let mut result = vec![updated];
-            if !filters.is_empty() {
-                result = result.into_iter()
-                    .map(|b| apply_row_filters(b, filters))
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            return Ok(result);
         }
 
-        // --- Cache miss: read from disk ---
+        // --- Cache miss (or ineligible/future entry): read from disk ---
         let patches = self.patch_log.get_patches_up_to(&pk, self.snapshot_tx_id);
         let has_patches = !patches.is_empty();
 
@@ -391,8 +412,9 @@ impl DirectExecutor {
         let has_disk_chunks = !chunks_by_col_group.is_empty();
         let has_multiple_groups = chunks_by_col_group.len() > 1;
 
-        // When patches exist, read ALL columns (no projection) so we cache a complete chunk.
-        // Filters are always deferred when patches exist (inserts need post-filtering).
+        // Patches need to be applied before filters because inserts and
+        // updates can change filter values. Read the selected column groups
+        // without row filtering, then project patches to the resulting schema.
         let read_projection = if has_patches { None } else { projection };
         let apply_filters_in_read = !has_multiple_groups && !has_patches;
 
@@ -428,15 +450,21 @@ impl DirectExecutor {
             return Ok(vec![]);
         };
 
-        // Apply patches up to snapshot tx_id
+        // Apply patches up to snapshot tx_id. Patch batches use the full
+        // table schema; physical chunks may contain only selected groups.
         if has_patches {
             result = result.into_iter()
-                .map(|batch| apply_patches(batch, &patches))
+                .map(|batch| {
+                    let projected = project_patches_to_schema(&patches, &batch.schema())?;
+                    apply_patches(batch, &projected)
+                })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Cache the full patched chunk (pre-filter, all columns)
-            if let Some(batch) = result.first() {
-                self.chunk_cache.put(ck, batch.clone(), self.snapshot_tx_id);
+            // Only full-width batches are safe under the row-cell cache key.
+            if cache_eligible {
+                if let Some(batch) = result.first() {
+                    self.chunk_cache.put(ck, batch.clone(), self.snapshot_tx_id);
+                }
             }
         }
 
@@ -786,9 +814,9 @@ fn read_parquet_sync_with_pruning(
         }
     }
 
-    if !valid_row_groups.is_empty() {
-        builder = builder.with_row_groups(valid_row_groups);
-    }
+    // An empty selection must stay empty. Omitting `with_row_groups` here
+    // would mean "read every group" and silently undo successful pruning.
+    builder = builder.with_row_groups(valid_row_groups);
 
     // Column projection
     if let Some(cols) = projection {
@@ -904,4 +932,3 @@ fn should_read_row_group(
 
     true // Read this row group
 }
-

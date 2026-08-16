@@ -5,6 +5,10 @@
 > coordinates + split machinery on the row dimension. Agreed deviation from the
 > phased plan: **Phase 1 (WAL + hot buffer) is deferred to a later MVP release**
 > by explicit decision; consequences are spelled out in §7.
+>
+> Historical note (2026-08-16): Phase 3 is now implemented by
+> [release-0.5-adaptive-multidimensional-grid.md](release-0.5-adaptive-multidimensional-grid.md).
+> This document intentionally keeps the narrower 0.2 design as released.
 
 ---
 
@@ -272,7 +276,9 @@ file ≤ `max_cell_rows` rows (uniform-row-count property, architecture doc
 
 - Phase 1 (WAL + hot buffer) — durability half shipped in 0.3 (WAL-backed
   PatchLog); the queryable hot buffer + insert-side WAL remain.
-- Phase 3 — hash/range splits (extendible hashing), in-file sort + bloom,
-  undersized-cell merge, maintenance loop, orphan-file GC.
+- ~~Phase 3 — hash/range splits (extendible hashing), in-file sort + bloom and
+  undersized-cell merge.~~ Shipped in
+  [release 0.5](release-0.5-adaptive-multidimensional-grid.md). Orphan-file GC
+  shipped in release 0.4; scheduled maintenance remains open.
 - Skew benchmark (small-files before/after) — planned as the headline number
   for the README once Phase 2 lands.

@@ -9,7 +9,7 @@ pub mod config;
 pub use config::TableConfig;
 
 pub mod storage;
-pub use storage::{ChunkCoordinate, ChunkInfo};
+pub use storage::{CellCoordinate, ChunkCoordinate, ChunkInfo};
 
 pub mod catalog;
 pub use catalog::{VersionCatalog, HashRegistry};
@@ -17,7 +17,7 @@ pub use catalog::{VersionCatalog, HashRegistry};
 pub mod partitioning;
 
 pub mod write;
-pub use write::BatchInserter;
+pub use write::{BatchInserter, RebalanceResult};
 
 pub mod query;
 pub use query::{Filter, FilterOp, FilterValue, CompositeFilter, QueryBuilder, DirectExecutor};
@@ -25,9 +25,7 @@ pub use query::{Filter, FilterOp, FilterValue, CompositeFilter, QueryBuilder, Di
 pub mod concurrency;
 
 pub mod api;
-pub use api::{ChunkDb, GcResult, TableBuilder};
+pub use api::{AdaptiveGridStats, ChunkDb, GcResult, TableBuilder};
 
 // Re-export commonly used Arrow types
 pub use arrow::array::RecordBatch;
-
-

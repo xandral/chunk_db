@@ -1,13 +1,13 @@
-use arrow::array::{RecordBatch, UInt64Array};
+use arrow::array::RecordBatch;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::catalog::{VersionCatalog, HashRegistry};
 use crate::concurrency::CompactionLock;
 use crate::config::table_config::TableConfig;
-use crate::partitioning::{ColumnGroupMapper, LevelMap};
+use crate::partitioning::{ColumnGroupMapper, DimensionMap, LevelMap, SplitAxis};
 use crate::query::{DirectExecutor, QueryBuilder};
 use crate::storage::ChunkCache;
 use crate::write::{BatchInserter, PatchLog, PatchOp, StreamInserter, StreamConfig};
@@ -21,6 +21,12 @@ struct TableState {
     column_mapper: ColumnGroupMapper,
     /// Adaptive row grid refinement map (empty = pure level-0 fixed grid)
     level_map: Arc<LevelMap>,
+    /// Local hash/range refinement tree layered inside each row leaf.
+    dimension_map: Arc<DimensionMap>,
+    /// Serializes merge-on-write operations for this table. Without this,
+    /// concurrent writers can both read the same previous chunk version and
+    /// whichever catalog update lands last silently loses the other batch.
+    write_lock: Arc<Mutex<()>>,
 }
 
 /// Main database handle
@@ -42,6 +48,8 @@ fn build_table_state(
     version_catalog: &VersionCatalog,
     config: TableConfig,
 ) -> Result<TableState> {
+    config.validate()?;
+
     let hash_registries: Vec<HashRegistry> = config
         .partitioning
         .hash_dimensions
@@ -63,11 +71,27 @@ fn build_table_state(
         version_catalog.load_level_map(&config.name)?,
     )?);
 
+    let hash_base_buckets: Vec<u64> = config.partitioning.hash_dimensions
+        .iter()
+        .map(|dimension| dimension.num_buckets)
+        .collect();
+    let range_chunk_sizes: Vec<u64> = config.partitioning.range_dimensions
+        .iter()
+        .map(|dimension| dimension.chunk_size)
+        .collect();
+    let dimension_map = Arc::new(DimensionMap::from_snapshot(
+        &hash_base_buckets,
+        &range_chunk_sizes,
+        version_catalog.load_dimension_map(&config.name)?,
+    )?);
+
     Ok(TableState {
         config,
         hash_registries,
         column_mapper,
         level_map,
+        dimension_map,
+        write_lock: Arc::new(Mutex::new(())),
     })
 }
 
@@ -144,14 +168,16 @@ impl ChunkDb {
     }
 
     fn build_inserter(&self, table_state: &TableState) -> BatchInserter {
-        BatchInserter::new(
+        BatchInserter::new_with_write_lock(
             table_state.config.clone(),
             self.version_catalog.clone(),
             self.catalog_db.clone(),
             table_state.level_map.clone(),
+            table_state.dimension_map.clone(),
             self.patch_log.clone(),
             self.chunk_cache.clone(),
             self.compaction_lock.clone(),
+            table_state.write_lock.clone(),
         )
     }
 
@@ -204,12 +230,12 @@ impl ChunkDb {
     }
 
     /// Start a query with column selection
-    pub fn select(&self, columns: &[&str]) -> QueryBuilder {
+    pub fn select(&self, columns: &[&str]) -> QueryBuilder<'_> {
         QueryBuilder::new(self).select(columns)
     }
 
     /// Start a query selecting all columns from a table
-    pub fn select_all(&self, table_name: &str) -> QueryBuilder {
+    pub fn select_all(&self, table_name: &str) -> QueryBuilder<'_> {
         QueryBuilder::new(self).select_all().from(table_name)
     }
 
@@ -245,43 +271,18 @@ impl ChunkDb {
 
     /// Update rows. The batch must contain __row_id (UInt64) and all columns of the table.
     pub fn update_rows(&self, table_name: &str, batch: &RecordBatch) -> Result<u64> {
-        let table_state = self.tables.get(table_name)
-            .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
-
         // Cell patches only reach materialized rows — flush the hot buffer
         // first so buffered rows can be updated too.
         self.flush_hot_buffer(table_name)?;
-
-        let tx_id = self.version_catalog.next_transaction_id()?;
-
-        let row_id_idx = batch.schema().index_of("__row_id")?;
-        let row_ids = batch.column(row_id_idx).as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| ChunkDbError::Config("__row_id must be UInt64".into()))?;
-
-        // Group row indices by leaf row cell. The routing guard stays alive
-        // until the patches are recorded (see delete_rows).
-        let router = table_state.level_map.routing();
-        let mut by_cell: HashMap<(u16, u64), Vec<usize>> = HashMap::new();
-        for i in 0..row_ids.len() {
-            let cell = router.route(row_ids.value(i));
-            by_cell.entry(cell).or_default().push(i);
-        }
-
-        for ((level, bucket), indices) in by_cell {
-            let sub_batch = take_rows(batch, &indices)?;
-            let key = patch_key(table_name, level, bucket);
-            self.patch_log.record(&key, tx_id, PatchOp::Update(sub_batch))?;
-        }
-        drop(router);
-
-        Ok(tx_id)
+        self.inserter(table_name)?.update_rows(batch)
     }
 
     /// Run compaction on all dirty chunks for a table. Also materializes the
     /// hot buffer first, so "after compact everything lives in Parquet and
     /// the WAL is empty" stays true.
     pub fn compact(&self, table_name: &str) -> Result<crate::write::CompactionResult> {
+        let table_state = self.tables.get(table_name)
+            .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
         self.flush_hot_buffer(table_name)?;
         let compactor = crate::write::Compactor::new(
             &self.version_catalog,
@@ -289,8 +290,26 @@ impl ChunkDb {
             &self.chunk_cache,
             &self.base_path,
             &self.compaction_lock,
+            &table_state.config,
         );
-        compactor.compact_all(table_name)
+        let mut result = {
+            // Compaction is a read/modify/write of the same base files as an
+            // insert. Sharing the table writer lock prevents either catalog
+            // update from silently winning over the other.
+            let _write_guard = table_state.write_lock.lock().unwrap();
+            compactor.compact_all(table_name)?
+        };
+        let rebalance = self.build_inserter(table_state).rebalance_underfilled()?;
+        result.cells_merged = rebalance.cells_merged;
+        Ok(result)
+    }
+
+    /// Coalesce underfilled local hash/range siblings without running patch
+    /// compaction first. Cells with pending patches are skipped safely.
+    pub fn rebalance(&self, table_name: &str) -> Result<crate::write::RebalanceResult> {
+        let table_state = self.tables.get(table_name)
+            .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
+        self.build_inserter(table_state).rebalance_underfilled()
     }
 
     /// Get a reference to the patch log (for advanced usage)
@@ -306,6 +325,47 @@ impl ChunkDb {
         Ok(chunks.iter()
             .map(|(coord, version)| crate::storage::format_chunk_filename(coord, *version))
             .collect())
+    }
+
+    /// Inspect the currently persisted adaptive-grid shape without scanning
+    /// Parquet data.
+    pub fn adaptive_grid_stats(&self, table_name: &str) -> Result<AdaptiveGridStats> {
+        let table_state = self.tables.get(table_name)
+            .ok_or_else(|| ChunkDbError::Config(format!("Table '{}' not found", table_name)))?;
+        let chunks = self.version_catalog.all_chunks(table_name)?;
+        let logical_cells: std::collections::HashSet<_> = chunks.iter()
+            .map(|(coord, _)| coord.cell())
+            .collect();
+        let dimension_snapshot = table_state.dimension_map.snapshot();
+
+        let mut stats = AdaptiveGridStats {
+            row_internal_cells: table_state.level_map.snapshot().len(),
+            local_internal_cells: dimension_snapshot.len(),
+            logical_leaf_cells: logical_cells.len(),
+            physical_chunks: chunks.len(),
+            ..AdaptiveGridStats::default()
+        };
+        for (cell, axis) in dimension_snapshot {
+            match axis {
+                SplitAxis::Hash(_) => stats.hash_splits += 1,
+                SplitAxis::Range(_) => stats.range_splits += 1,
+            }
+            stats.max_hash_level = stats.max_hash_level
+                .max(cell.hash_levels.iter().copied().max().unwrap_or(0));
+            stats.max_range_level = stats.max_range_level
+                .max(cell.range_levels.iter().copied().max().unwrap_or(0));
+        }
+        stats.max_row_level = chunks.iter()
+            .map(|(coord, _)| coord.level)
+            .max()
+            .unwrap_or(0);
+        for cell in logical_cells {
+            stats.max_hash_level = stats.max_hash_level
+                .max(cell.hash_levels.iter().copied().max().unwrap_or(0));
+            stats.max_range_level = stats.max_range_level
+                .max(cell.range_levels.iter().copied().max().unwrap_or(0));
+        }
+        Ok(stats)
     }
 
     /// Delete orphaned chunk files: superseded versions and pre-split parents
@@ -387,6 +447,8 @@ impl ChunkDb {
         let base_path = self.base_path.clone();
         let compaction_lock = self.compaction_lock.clone();
         let table = table_name.to_string();
+        let table_runtime = self.tables.get(table_name)
+            .map(|state| (state.config.clone(), state.write_lock.clone()));
 
         let join_handle = tokio::spawn(async move {
             loop {
@@ -402,14 +464,21 @@ impl ChunkDb {
                 // Check if compaction is needed
                 let total = patch_log.total_entries();
                 if total >= config.max_total_patches {
+                    let Some((table_config, write_lock)) = table_runtime.as_ref() else {
+                        break;
+                    };
                     let compactor = Compactor::new(
                         &version_catalog,
                         &patch_log,
                         &chunk_cache,
                         &base_path,
                         &compaction_lock,
+                        table_config,
                     );
-                    let _ = compactor.compact_all(&table);
+                    let _ = {
+                        let _write_guard = write_lock.lock().unwrap();
+                        compactor.compact_all(&table)
+                    };
                 }
             }
         });
@@ -425,6 +494,19 @@ pub struct GcResult {
     pub bytes_reclaimed: u64,
     /// Unreferenced files skipped because they were younger than `min_age`
     pub files_kept_young: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AdaptiveGridStats {
+    pub row_internal_cells: usize,
+    pub local_internal_cells: usize,
+    pub hash_splits: usize,
+    pub range_splits: usize,
+    pub logical_leaf_cells: usize,
+    pub physical_chunks: usize,
+    pub max_row_level: u16,
+    pub max_hash_level: u16,
+    pub max_range_level: u16,
 }
 
 /// Builder for creating tables programmatically
@@ -562,15 +644,4 @@ pub(crate) fn patch_key(table_name: &str, level: u16, row_bucket: u64) -> Vec<u8
 /// skips it, and no cell scan ever applies it as a chunk patch.
 pub(crate) fn hot_buffer_key(table_name: &str) -> Vec<u8> {
     format!("hot:{}", table_name).into_bytes()
-}
-
-/// Extract specific rows from a RecordBatch by index
-fn take_rows(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
-    let indices_arr = arrow::array::UInt32Array::from_iter_values(
-        indices.iter().map(|&i| i as u32)
-    );
-    let columns: Result<Vec<arrow::array::ArrayRef>> = batch.columns().iter()
-        .map(|col| Ok(arrow::compute::take(col.as_ref(), &indices_arr, None)?))
-        .collect();
-    Ok(RecordBatch::try_new(batch.schema(), columns?)?)
 }

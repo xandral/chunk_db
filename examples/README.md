@@ -64,10 +64,10 @@ Head-to-head benchmark comparing ChunkDB against DuckDB (native format and Parqu
 
 ```bash
 # Default parameters
-cargo run --release --example chunkdb_vs_duckdb_benchmark
+cargo run --release --features duckdb-benchmark --example chunkdb_vs_duckdb_benchmark
 
 # Customized
-cargo run --release --example chunkdb_vs_duckdb_benchmark -- \
+cargo run --release --features duckdb-benchmark --example chunkdb_vs_duckdb_benchmark -- \
   -r 200000 -c 30 -s 50 --chunk-rows 5000 --hash-buckets 10 \
   --column-groups -b 5 -w 2
 ```
@@ -81,6 +81,26 @@ Parameters:
 - `--column-groups`: Enable 3 column groups
 - `-b` / `--benchmark-runs`: Timed runs per query (default: 10)
 - `-w` / `--warmup-runs`: Warmup runs (default: 3)
+
+### `decisive_layout_benchmark.rs`
+
+**Correctness-checked storage-layout gate**
+
+Compares the fixed rectangular grid, the adaptive multidimensional grid and a
+single timestamp-sorted Parquet file. It crosses uniform/Zipf distributions
+with ordered/UUID row IDs and records file size, split topology, candidate
+bytes, row counts and warm latency.
+
+```bash
+cargo run --release --example decisive_layout_benchmark -- \
+  --profile quick --output benchmarks/results/decisive_quick_phase3.csv
+
+cargo run --release --example decisive_layout_benchmark -- \
+  --profile full --output benchmarks/results/decisive_full_phase3.csv
+```
+
+See [`docs/decisive-tests-and-verdict.md`](../docs/decisive-tests-and-verdict.md)
+for the final interpretation.
 
 ## Query API Reference
 
@@ -158,9 +178,10 @@ db.select_all("table")
    .add_column_group(vec!["cold_columns"])
    ```
 
-5. **Set appropriate chunk_rows**
+5. **Use a coarse base grid with adaptive refinement**
    ```rust
-   .chunk_rows(10000)  // Balance: larger = fewer files, smaller = better pruning
+   .chunk_rows(1_000_000)
+   .max_cell_rows(100_000)
    ```
 
 ## Data Types Supported

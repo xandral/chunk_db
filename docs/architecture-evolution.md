@@ -1,8 +1,16 @@
 # Architecture Evolution: from Fixed Grid to Hierarchical Adaptive Grid
 
-> Status: design document, 2026-06. Describes why the current fixed multi-dimensional
-> grid cannot survive data skew, and the agreed target architecture that replaces it
-> while preserving ChunkDB's coordinate-based identity.
+> Original design: 2026-06. Implementation status updated 2026-08-16.
+> Phases 1-3 are now implemented. The measured outcome and the architectural
+> boundary discovered in Phase 3 are documented in
+> [decisive-tests-and-verdict.md](decisive-tests-and-verdict.md).
+
+The current implementation uses a global adaptive row `LevelMap` plus a
+per-row-leaf `DimensionMap` for local hash/range refinement. It also includes
+sibling merge, in-file sort, bounded row groups and Parquet Bloom filters.
+Two aspirations in the original text below are not yet true: queries still
+enumerate the in-memory catalog before pruning, and the direct executor does
+not yet consume the Bloom filters it writes.
 
 ---
 
@@ -127,6 +135,12 @@ fine; Delta/Iceberg: large files + Z-order + stats).
 User-declared "index dimensions" from table setup become the **in-file sort
 key**, no longer physical bucket axes.
 
+> Implementation note (2026-08): rows are sorted by configured range
+> dimensions, then hash dimensions, then `__row_id`; row groups are bounded at
+> 8.192 rows. Bloom filters are persisted for hash keys and `__row_id`, but
+> query-time Bloom lookup remains pending. Hash/range dimensions remain
+> physical axes as well as sort keys.
+
 ## 4. Write path: hot buffer, WAL, split-instead-of-compaction
 
 ```
@@ -170,6 +184,10 @@ queryable before any flush. Routing/pruning descends the refinement map like a
 map zoom — compute the level-0 coordinate, if marked refined recompute at the
 next level, repeat; every step is a formula, the map only says where to stop.
 
+> Implementation note (2026-08): insert/update routing performs this descent.
+> Query pruning is level-aware but still starts from `all_chunks()` served by
+> the catalog's in-memory index; formula-only candidate enumeration is open.
+
 ## 6. Component mapping
 
 | Reused as-is | Transformed | Removed |
@@ -182,15 +200,11 @@ next level, repeat; every step is a formula, the map only says where to stop.
 
 ## 7. Phased plan
 
-> Status (2026-07-12): **Phase 1 and Phase 2 are complete.** Phase 2 shipped
-> as release 0.2
-> ([release-0.2-adaptive-row-grid.md](release-0.2-adaptive-row-grid.md), zone
-> maps deferred to Phase 3); the durability half of Phase 1 shipped as
-> release 0.3 ([release-0.3-patch-wal.md](release-0.3-patch-wal.md),
-> WAL-backed PatchLog); the queryable hot buffer + insert-side WAL (plus
-> orphan-file GC) shipped as release 0.4
-> ([release-0.4-hot-buffer-gc.md](release-0.4-hot-buffer-gc.md)). Next up:
-> Phase 3.
+> Status (2026-08-16): **Phases 1-3 are complete.** Phase 2 shipped as
+> [release 0.2](release-0.2-adaptive-row-grid.md); the durable patch WAL as
+> [release 0.3](release-0.3-patch-wal.md); the queryable insert buffer and GC
+> as [release 0.4](release-0.4-hot-buffer-gc.md); multidimensional refinement
+> as [release 0.5](release-0.5-adaptive-multidimensional-grid.md).
 
 1. **WAL + queryable hot buffer.** Self-contained; fixes durability (the most
    serious v0 gap) and delivers the "insert → instantly queryable" demo.
@@ -198,21 +212,28 @@ next level, repeat; every step is a formula, the map only says where to stop.
 2. **`level` in coordinates + split machinery.** Splits on the row/time
    dimension only (degenerate case ≈ adaptive row buckets). Level-aware
    pruning replaces the catalog scan. Zone maps per cell.
-3. **Multi-dimension splits** (measured split-dimension choice, extendible
-   hashing for hash dims) + merge of undersized neighbor cells + in-file sort
-   and bloom filters.
+3. **Multi-dimension splits.** ✅ Measured split-dimension choice, local-depth
+   extendible hashing, hierarchical range splits, merge of undersized sibling
+   cells, in-file sort, bounded row groups and Bloom-filter writes. Custom
+   zone maps and query-time Bloom consumption remain open.
 4. **(Optional, research)** Workload-driven splits (qd-tree style): collect
    predicate statistics and re-split in the background where pruning fails.
    Explicitly *not* part of the core pitch.
 
+The decisive benchmark exposed a prerequisite before Phase 4: a split-only
+tree cannot repair a base grid whose cells are already too small. The next
+storage phase should therefore separate logical cells from packed physical
+segments and publish segment versions through an atomic manifest. Workload
+feedback is useful only after that physical packing layer exists.
+
 ## 8. Positioning
 
 **"Geohash for tables"** — an embedded columnar store whose chunk grid refines
-itself where data gets dense. Recognizable in ten seconds by anyone who knows
-geohash/H3, faithful to the original Zarr-inspired coordinate idea, and it
-removes the configuration guesswork that the fixed grid required. The hot
-buffer adds an honest HTAP-lite property (fresh reads) without claiming full
-HTAP semantics.
+itself where data gets dense. It is faithful to the original Zarr-inspired
+coordinate idea, and the hot buffer adds an honest HTAP-lite property (fresh
+reads) without claiming full HTAP semantics. Phase 3 shows that configuration
+guesswork is reduced, not eliminated: the base grid must still be coarse
+enough to avoid underfilled level-zero intersections.
 
 What this is *not* claiming: novel mechanisms. Extendible hashing, memtables,
 WALs and zone maps are textbook. The product claim is the combination — an
